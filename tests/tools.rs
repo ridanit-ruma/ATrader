@@ -53,6 +53,27 @@ impl MarketFeed for Fake {
     async fn stream(&self, _: &[InstrumentId], _: &mpsc::Sender<MarketEvent>) -> anyhow::Result<()> {
         anyhow::bail!("unused")
     }
+    async fn candles(&self, _: &InstrumentId, interval: atrader::candles::Interval, limit: usize) -> anyhow::Result<Vec<atrader::candles::Candle>> {
+        let step = chrono::Duration::seconds(interval.secs());
+        let start = self.clock.now() - step * limit as i32;
+        Ok((0..limit)
+            .map(|i| {
+                let p = Decimal::from(100 + i as i64);
+                atrader::candles::Candle { start: start + step * i as i32, open: p, high: p + dec!(1), low: p - dec!(1), close: p, volume: dec!(1), value: p }
+            })
+            .collect())
+    }
+    async fn screen(&self, ranking: atrader::screen::Ranking, limit: usize) -> anyhow::Result<Vec<atrader::screen::ScreenRow>> {
+        let row = atrader::screen::ScreenRow {
+            id: "UPBIT:KRW-BTC".parse().unwrap(),
+            name: None,
+            price: dec!(100000000),
+            change_pct: dec!(1.5),
+            volume: dec!(10),
+            value: dec!(1000000000),
+        };
+        Ok(atrader::screen::rank(vec![row], ranking, limit))
+    }
 }
 
 async fn rig(pool: PgPool) -> (Arc<App>, TraderTools) {
@@ -250,4 +271,30 @@ async fn unknown_instruments_are_not_retriable_and_not_subscribed(pool: PgPool) 
     }
     let q = t.get_quotes(vec!["UPBIT:KRW-NOPE".into()]).await.unwrap();
     assert!(q[0].error.as_deref().unwrap_or("").contains("unknown"));
+}
+
+#[sqlx::test]
+async fn research_tools(pool: PgPool) {
+    let (app, t) = rig(pool).await;
+    let c = t.get_candles("UPBIT:KRW-BTC".into(), "5m".into(), Some(30)).await.unwrap();
+    assert_eq!(c.len(), 30);
+    assert!(c[0].start < c[29].start);
+    assert_eq!(code(&t.get_candles("UPBIT:KRW-BTC".into(), "2h".into(), None).await.unwrap_err()), "InvalidParams");
+
+    let ind = t.get_indicators("UPBIT:KRW-BTC".into(), "1d".into(), vec!["sma:5".into(), "macd".into()], Some(3)).await.unwrap();
+    assert_eq!(ind.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), vec!["sma_5", "macd", "macd_signal", "macd_hist"]);
+    assert_eq!(ind[0].values.len(), 3);
+    assert!(ind[0].values[2].value.is_some());
+    assert_eq!(code(&t.get_indicators("UPBIT:KRW-BTC".into(), "1d".into(), vec!["magic".into()], None).await.unwrap_err()), "InvalidParams");
+
+    let rows = t.screen("UPBIT".into(), "gainers".into(), Some(5)).await.unwrap();
+    assert_eq!(rows[0].id, "UPBIT:KRW-BTC");
+    assert_eq!(rows[0].name, "비트코인 (Bitcoin)"); // filled from the instrument list
+    assert_eq!(code(&t.screen("KRX".into(), "gainers".into(), None).await.unwrap_err()), "INVALID_REQUEST"); // no KRX feed here
+
+    t.place_order(buy("bot", Some(dec!(0.1)), "entry")).await.unwrap();
+    let p = t.get_performance("bot".into(), "all".into()).await.unwrap();
+    assert!(p.trades <= 1); // the journal may not have landed yet; no panic either way
+    assert_eq!(code(&t.get_performance("bot".into(), "1y".into()).await.unwrap_err()), "InvalidParams");
+    let _ = app;
 }

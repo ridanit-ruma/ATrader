@@ -372,3 +372,72 @@ impl From<&Conversion> for ConversionView {
         ConversionView { from: c.from.code().into(), to: c.to.code().into(), debit: c.debit, credit: c.credit, rate: c.rate }
     }
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CandleView {
+    /// Bucket start.
+    pub start: DateTime<Utc>,
+    pub open: Decimal,
+    pub high: Decimal,
+    pub low: Decimal,
+    pub close: Decimal,
+    /// Shares or coins.
+    pub volume: Decimal,
+    /// Traded value, quote currency.
+    pub value: Decimal,
+}
+
+impl From<&crate::candles::Candle> for CandleView {
+    fn from(c: &crate::candles::Candle) -> Self {
+        CandleView { start: c.start, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume, value: c.value }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct IndicatorValue {
+    /// Start of the candle this value belongs to.
+    pub at: DateTime<Utc>,
+    /// Absent while the indicator lacks history.
+    pub value: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct IndicatorLine {
+    /// e.g. `sma_20`, `rsi_14`, `macd`, `macd_signal`, `macd_hist`, `bb_upper`, `atr_14`, `vol_20`.
+    pub name: String,
+    /// Oldest first; the last is the latest.
+    pub values: Vec<IndicatorValue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ScreenRowView {
+    pub id: String,
+    pub name: String,
+    pub price: Decimal,
+    /// Versus the previous close (24 h for crypto), percent.
+    pub change_pct: Decimal,
+    pub volume: Decimal,
+    /// Traded value, quote currency.
+    pub value: Decimal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PerformanceView {
+    pub period: String,
+    pub start_equity_krw: Decimal,
+    pub end_equity_krw: Decimal,
+    pub return_pct: Decimal,
+    /// Largest peak-to-trough fall of equity within the period, percent.
+    pub max_drawdown_pct: Decimal,
+    /// Annualized volatility of daily returns, percent; needs a few days of history.
+    pub volatility_pct: Option<f64>,
+    pub sharpe: Option<f64>,
+    pub trades: usize,
+    pub sells: usize,
+    /// Share of sells with positive realized profit, percent.
+    pub win_rate_pct: Option<Decimal>,
+    pub realized_pnl_krw: Decimal,
+    pub fees_krw: Decimal,
+    /// Traded value over average equity.
+    pub turnover: Option<Decimal>,
+}

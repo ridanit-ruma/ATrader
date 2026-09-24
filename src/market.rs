@@ -60,6 +60,10 @@ impl Market {
         rx
     }
 
+    pub fn feed(&self, venue: Venue) -> Option<Arc<dyn MarketFeed>> {
+        self.venues.get(&venue).map(|v| v.feed.clone())
+    }
+
     /// Load every feed's instrument list into the broker. A venue whose list cannot be loaded
     /// is logged and skipped so the others still trade. Returns how many were offered.
     // ponytail: a skipped venue stays empty until restart; retry on a timer if outages prove common.

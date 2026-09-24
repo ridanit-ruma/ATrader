@@ -15,6 +15,10 @@ use crate::app::{App, value_account};
 use crate::broker::{OrderError, OrderRequest, OrderType, Tif};
 use crate::domain::{Currency, InstrumentId, Level, Venue};
 use crate::sim::Size;
+use crate::candles::{Candle, Interval, resample};
+use crate::indicators::{IndicatorSpec, compute};
+use crate::performance::performance;
+use crate::screen::Ranking;
 
 const STALE_AFTER_SECS: i64 = 5;
 const MAX_QUOTES: usize = 20;
@@ -74,6 +78,25 @@ pub trait Trader {
     /// Exchange cash between KRW, USD and USDT at the reference rate less a 0.1% spread. USD
     /// buys US stocks, USDT buys Binance coins, KRW buys KRX stocks and Upbit coins.
     async fn convert_currency(&self, account: String, from: String, to: String, amount: Decimal) -> zyris::Result<ConversionView>;
+
+    /// OHLCV candles, oldest first (the last may still be forming). `interval`: 1m, 5m, 15m, 1h,
+    /// 1d, 1w. `limit` default 100, at most 200. KRX/US minute candles exist only for periods
+    /// when ATrader was streaming that stock.
+    async fn get_candles(&self, id: String, interval: String, limit: Option<u32>) -> zyris::Result<Vec<CandleView>>;
+
+    /// Technical indicators computed on the server from candles. `indicators`: up to 8 of
+    /// `sma:N`, `ema:N`, `rsi[:N]`, `macd[:fast:slow:signal]`, `bb[:N:width]`, `atr[:N]`,
+    /// `vol[:N]` (stdev of log returns per bar, %). `points`: latest values per line, default
+    /// 1, at most 100.
+    async fn get_indicators(&self, id: String, interval: String, indicators: Vec<String>, points: Option<u32>) -> zyris::Result<Vec<IndicatorLine>>;
+
+    /// Venue ranking to find candidates. `venue`: KRX, US, UPBIT or BINANCE. `ranking`:
+    /// gainers, losers, volume or value (traded value). `limit` default 20, at most 50.
+    async fn screen(&self, venue: String, ranking: String, limit: Option<u32>) -> zyris::Result<Vec<ScreenRowView>>;
+
+    /// Account performance over `period`: 1d, 1w, 1m, 3m or all — return, max drawdown,
+    /// volatility, Sharpe, win rate, realized profit, fees and turnover (KRW).
+    async fn get_performance(&self, account: String, period: String) -> zyris::Result<PerformanceView>;
 }
 
 pub struct TraderTools {
@@ -123,6 +146,14 @@ pub fn order_error(e: OrderError) -> zyris::Error {
     coded(code, msg, data)
 }
 
+fn feed_error(e: anyhow::Error) -> zyris::Error {
+    let msg = format!("{e:#}");
+    match msg.strip_prefix("unsupported: ") {
+        Some(rest) => order_error(OrderError::InvalidRequest(rest.to_string())),
+        None => upstream(msg),
+    }
+}
+
 fn parse_id(s: &str) -> Result<InstrumentId, zyris::Error> {
     s.trim().parse().map_err(|m: String| coded("UNKNOWN_INSTRUMENT", m, json!({})))
 }
@@ -164,6 +195,22 @@ fn to_request(o: &OrderInput) -> Result<OrderRequest, zyris::Error> {
 }
 
 impl TraderTools {
+    async fn candles(&self, id: &InstrumentId, interval: Interval, limit: usize) -> zyris::Result<Vec<Candle>> {
+        if interval.is_intraday() && id.venue.has_session() {
+            let since = self.app.broker.now() - chrono::Duration::seconds(interval.secs() * limit as i64 * 3);
+            let bars = self.app.store.bars(id, since).await.map_err(upstream)?;
+            let mut out = resample(&bars, interval);
+            let skip = out.len().saturating_sub(limit);
+            return Ok(out.split_off(skip));
+        }
+        let feed = self
+            .app
+            .market
+            .feed(id.venue)
+            .ok_or_else(|| order_error(OrderError::InvalidRequest(format!("{} market data is not enabled", id.venue.tag()))))?;
+        feed.candles(id, interval, limit).await.map_err(feed_error)
+    }
+
     /// Parse an id and require a loaded instrument, so typos fail fast and are never subscribed.
     fn known(&self, raw: &str) -> Result<InstrumentId, zyris::Error> {
         let id = parse_id(raw)?;
@@ -392,5 +439,83 @@ impl Trader for TraderTools {
         let usd_krw = self.app.fx.usd_krw().await.map_err(|e| upstream(format!("{e:#}")))?;
         let c = self.app.broker.convert_sync(&row.id, from, to, amount, usd_krw, self.app.fx_spread).map_err(order_error)?;
         Ok(ConversionView::from(&c))
+    }
+
+    async fn get_candles(&self, id: String, interval: String, limit: Option<u32>) -> zyris::Result<Vec<CandleView>> {
+        let id = self.known(&id)?;
+        let interval = Interval::parse(&interval).ok_or_else(|| bad("interval must be one of 1m, 5m, 15m, 1h, 1d, 1w"))?;
+        let limit = limit.unwrap_or(100).clamp(1, 200) as usize;
+        Ok(self.candles(&id, interval, limit).await?.iter().map(CandleView::from).collect())
+    }
+
+    async fn get_indicators(&self, id: String, interval: String, indicators: Vec<String>, points: Option<u32>) -> zyris::Result<Vec<IndicatorLine>> {
+        let id = self.known(&id)?;
+        let interval = Interval::parse(&interval).ok_or_else(|| bad("interval must be one of 1m, 5m, 15m, 1h, 1d, 1w"))?;
+        if indicators.is_empty() || indicators.len() > 8 {
+            return Err(bad("ask for 1 to 8 indicators"));
+        }
+        let specs = indicators.iter().map(|s| IndicatorSpec::parse(s)).collect::<Result<Vec<_>, _>>().map_err(bad)?;
+        let points = points.unwrap_or(1).clamp(1, 100) as usize;
+        let candles = self.candles(&id, interval, 200).await?;
+        let mut out = Vec::new();
+        for spec in &specs {
+            for (name, series) in compute(spec, &candles) {
+                let skip = series.len().saturating_sub(points);
+                let values = candles.iter().zip(series).skip(skip).map(|(c, v)| IndicatorValue { at: c.start, value: v.filter(|x| x.is_finite()) }).collect();
+                out.push(IndicatorLine { name, values });
+            }
+        }
+        Ok(out)
+    }
+
+    async fn screen(&self, venue: String, ranking: String, limit: Option<u32>) -> zyris::Result<Vec<ScreenRowView>> {
+        let venue = parse_venue(&venue)?;
+        let ranking = Ranking::parse(&ranking).ok_or_else(|| bad("ranking must be gainers, losers, volume or value"))?;
+        let limit = limit.unwrap_or(20).clamp(1, 50) as usize;
+        let feed = self
+            .app
+            .market
+            .feed(venue)
+            .ok_or_else(|| order_error(OrderError::InvalidRequest(format!("{} market data is not enabled", venue.tag()))))?;
+        let rows = feed.screen(ranking, limit).await.map_err(feed_error)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let name = r.name.clone().or_else(|| self.app.broker.instrument(&r.id).map(|i| i.name)).unwrap_or_default();
+                ScreenRowView { id: r.id.to_string(), name, price: r.price, change_pct: r.change_pct, volume: r.volume, value: r.value }
+            })
+            .collect())
+    }
+
+    async fn get_performance(&self, account: String, period: String) -> zyris::Result<PerformanceView> {
+        let row = self.app.agent_account(&account)?;
+        let days = match period.as_str() {
+            "1d" => Some(1),
+            "1w" => Some(7),
+            "1m" => Some(30),
+            "3m" => Some(90),
+            "all" => None,
+            _ => return Err(bad("period must be 1d, 1w, 1m, 3m or all")),
+        };
+        let since = days.map(|d| self.app.broker.now() - chrono::Duration::days(d));
+        let snaps = self.app.store.snapshots(&row.id, row.generation, since).await.map_err(upstream)?;
+        let fills = self.app.store.fills(&row.id, row.generation, since, 100_000).await.map_err(upstream)?;
+        let usd_krw = self.app.fx.usd_krw().await.map_err(|e| upstream(format!("{e:#}")))?;
+        let p = performance(&snaps, &fills, usd_krw);
+        Ok(PerformanceView {
+            period,
+            start_equity_krw: p.start_equity_krw,
+            end_equity_krw: p.end_equity_krw,
+            return_pct: p.return_pct,
+            max_drawdown_pct: p.max_drawdown_pct,
+            volatility_pct: p.volatility_pct.map(|v| (v * 100.0).round() / 100.0),
+            sharpe: p.sharpe.map(|v| (v * 100.0).round() / 100.0),
+            trades: p.trades,
+            sells: p.sells,
+            win_rate_pct: p.win_rate_pct,
+            realized_pnl_krw: p.realized_pnl_krw,
+            fees_krw: p.fees_krw,
+            turnover: p.turnover,
+        })
     }
 }
