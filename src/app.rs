@@ -59,9 +59,9 @@ pub fn krw_per(c: Currency, usd_krw: Decimal) -> Decimal {
     if c == Currency::Krw { Decimal::ONE } else { usd_krw }
 }
 
-/// Load every account's portfolio and open orders from the store into `broker`. Returns how
-/// many accounts were restored.
-pub async fn restore(store: &Store, broker: &SimBroker) -> anyhow::Result<usize> {
+/// Load every account's portfolio and open orders from the store into `broker`. Returns the
+/// generation each account was restored at; the journal writer must keep using these.
+pub async fn restore(store: &Store, broker: &SimBroker) -> anyhow::Result<HashMap<String, i32>> {
     let accounts = store.list_accounts().await?;
     for a in &accounts {
         broker.restore_account(&a.id, store.load_portfolio(&a.id, a.generation).await?);
@@ -73,5 +73,5 @@ pub async fn restore(store: &Store, broker: &SimBroker) -> anyhow::Result<usize>
         }
     }
     broker.set_next_order_id(store.max_order_id().await? + 1);
-    Ok(accounts.len())
+    Ok(accounts.into_iter().map(|a| (a.id, a.generation)).collect())
 }

@@ -461,3 +461,13 @@ fn restored_orders_reserve_and_fill_again() {
     let (next, _) = fresh.place_sync("a", market_buy(dec!(0.1))).unwrap();
     assert!(next.id > order.id);
 }
+
+#[test]
+fn closing_the_journal_lets_the_writer_drain_and_stop() {
+    let (b, _, mut rx) = journaled();
+    b.place_sync("a", market_buy(dec!(0.1))).unwrap();
+    b.close_journal();
+    b.place_sync("a", market_buy(dec!(0.1))).unwrap(); // after close: not journaled
+    assert_eq!(drain(&mut rx).len(), 2);
+    assert_eq!(rx.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Disconnected));
+}

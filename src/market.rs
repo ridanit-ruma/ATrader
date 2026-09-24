@@ -76,6 +76,9 @@ impl Market {
     /// subscribed. Fills caused by a fetched snapshot go out on the bus.
     pub async fn ensure_fresh(&self, id: &InstrumentId) -> anyhow::Result<()> {
         let vf = self.venues.get(&id.venue).ok_or_else(|| anyhow!("no feed for venue {}", id.venue.tag()))?;
+        if self.broker.instrument(id).is_none() {
+            anyhow::bail!("unknown instrument {id}");
+        }
         vf.subs.touch(id);
         if !self.broker.has_stats(id) {
             // On failure the broker keeps using its defaults and the next call retries.
@@ -212,6 +215,14 @@ mod tests {
         r.market.ensure_fresh(&btc()).await.unwrap();
         assert!(r.broker.has_stats(&btc()));
         assert_eq!(r.feed.stats.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn unknown_instruments_are_never_subscribed() {
+        let r = rig().await;
+        assert!(r.market.ensure_fresh(&"UPBIT:KRW-NOPE".parse().unwrap()).await.is_err());
+        assert!(r.subs.borrow().is_empty());
+        assert_eq!(r.feed.snaps.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

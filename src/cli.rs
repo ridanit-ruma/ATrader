@@ -140,8 +140,9 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
                 }
             }
             Command::AccountReset { id, cash } => {
+                // A running server keeps trading the old generation in memory; stop it first.
                 let generation = store.reset_account(&id, &cash, chrono::Utc::now()).await?;
-                println!("account {id} reset (generation {generation}); restart a running `atrader serve` to pick it up");
+                println!("account {id} reset (generation {generation}); start `atrader serve` again to trade it");
             }
             Command::Serve { zyris } => serve(store, zyris).await?,
             Command::Help | Command::Version => unreachable!("handled above"),
@@ -184,11 +185,11 @@ async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
     }
     drop(events_tx);
     let instruments = market.load_instruments().await?;
-    let accounts = restore(&store, &broker).await?;
-    tracing::info!(instruments, accounts, "state restored");
+    let generations = restore(&store, &broker).await?;
+    tracing::info!(instruments, accounts = generations.len(), "state restored");
 
     tokio::spawn(pump(events_rx, broker.clone(), bus.clone()));
-    tokio::spawn(persist(journal_rx, store.clone(), bus.clone()));
+    let writer = tokio::spawn(persist(journal_rx, store.clone(), bus.clone(), generations));
     let app = Arc::new(App::new(broker.clone(), store, market, FxCache::new()).await?);
     app.market.refresh_pins();
 
@@ -203,9 +204,9 @@ async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
     });
 
     let Some(token) = token else {
-        tracing::info!("running without zyris; Ctrl-C to stop");
-        tokio::signal::ctrl_c().await?;
-        return Ok(());
+        tracing::info!("running without zyris; Ctrl-C or SIGTERM to stop");
+        shutdown_signal().await?;
+        return drain(&broker, writer).await;
     };
     let server = std::env::var("ZYRIS_SERVER_URL").unwrap_or_else(|_| zyris::DEFAULT_SERVER_URL.to_string());
     let name = std::env::var("ATRADER_NODE_NAME").unwrap_or_else(|_| "atrader".into());
@@ -218,9 +219,37 @@ async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
         .await?;
     tracing::info!(node = %link.node_id(), %server, "serving trader capability");
     tokio::select! {
-        closed = link.wait_closed() => closed?,
-        _ = tokio::signal::ctrl_c() => link.disconnect().await,
+        closed = link.wait_closed() => {
+            if let Err(e) = closed {
+                drain(&broker, writer).await?;
+                return Err(e.into());
+            }
+        }
+        signal = shutdown_signal() => {
+            signal?;
+            link.disconnect().await;
+        }
     }
+    drain(&broker, writer).await
+}
+
+/// Ctrl-C or SIGTERM (what systemd sends on stop).
+async fn shutdown_signal() -> anyhow::Result<()> {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        r = tokio::signal::ctrl_c() => r?,
+        _ = term.recv() => {}
+    }
+    Ok(())
+}
+
+/// Stop journaling and wait for everything already queued to reach the database.
+async fn drain(broker: &SimBroker, writer: tokio::task::JoinHandle<()>) -> anyhow::Result<()> {
+    tracing::info!("shutting down; flushing the journal");
+    broker.close_journal();
+    tokio::time::timeout(std::time::Duration::from_secs(120), writer)
+        .await
+        .context("journal did not drain within 120 s")??;
     Ok(())
 }
 #[cfg(test)]

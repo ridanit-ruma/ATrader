@@ -159,11 +159,48 @@ async fn persister_writes_in_order_then_republishes(pool: PgPool) {
     let c = Conversion { from: Currency::Krw, to: Currency::Usd, debit: dec!(1365350), credit: dec!(999), rate: dec!(0.00073167) };
     tx.send(Journal::Conversion { account: "a".into(), conversion: c, at: Utc::now() }).unwrap();
     drop(tx);
-    persist(rx, store.clone(), bus).await;
+    persist(rx, store.clone(), bus, std::collections::HashMap::new()).await;
 
     let cash = store.cash_balances("a", 1).await.unwrap();
     assert_eq!(cash[&Currency::Krw], dec!(2000000) - dec!(700105) - dec!(1365350));
     assert_eq!(cash[&Currency::Usd], dec!(999));
     assert!(matches!(events.recv().await.unwrap(), BusEvent::Order(o) if o.id == 1));
     assert!(matches!(events.recv().await.unwrap(), BusEvent::Fill(f) if f.order_id == 1));
+}
+
+#[sqlx::test]
+async fn persister_keeps_the_generation_it_started_with(pool: PgPool) {
+    use atrader::persist::persist;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    let store = Arc::new(Store::new(pool));
+    store.create_account("a", "Test", None, &[(Currency::Krw, dec!(2000000))], Utc::now()).await.unwrap();
+    let started_with = HashMap::from([("a".to_string(), 1)]);
+    store.reset_account("a", &[(Currency::Krw, dec!(5))], Utc::now()).await.unwrap(); // reset while serving
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (bus, _) = tokio::sync::broadcast::channel(16);
+    tx.send(Journal::Order(order(1))).unwrap();
+    tx.send(Journal::Fill(fill(1, Side::Buy, dec!(10), dec!(700000), dec!(105), dec!(0)))).unwrap();
+    drop(tx);
+    persist(rx, store.clone(), bus, started_with).await;
+    assert_eq!(store.cash_balances("a", 1).await.unwrap()[&Currency::Krw], dec!(2000000) - dec!(700105));
+    assert_eq!(store.cash_balances("a", 2).await.unwrap()[&Currency::Krw], dec!(5));
+}
+
+#[sqlx::test]
+async fn persister_skips_integrity_failures_without_stalling(pool: PgPool) {
+    use atrader::persist::persist;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    let store = Arc::new(Store::new(pool));
+    store.create_account("a", "Test", None, &[(Currency::Krw, dec!(2000000))], Utc::now()).await.unwrap();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (bus, _) = tokio::sync::broadcast::channel(16);
+    tx.send(Journal::Fill(fill(99, Side::Buy, dec!(1), dec!(1), dec!(0), dec!(0)))).unwrap(); // no order 99
+    tx.send(Journal::Order(order(1))).unwrap();
+    drop(tx);
+    let started = std::time::Instant::now();
+    persist(rx, store.clone(), bus, HashMap::new()).await;
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "retried a permanent failure");
+    assert_eq!(store.max_order_id().await.unwrap(), 1);
 }

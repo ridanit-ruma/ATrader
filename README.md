@@ -53,8 +53,8 @@ ZYRIS_CREDENTIAL=zc_... atrader serve
 atrader serve --no-zyris
 ```
 
-`atrader account reset <id>` starts an account over. Its history is kept, and a running server
-picks up the reset after a restart.
+`atrader account reset <id>` starts an account over and keeps its history. Stop `atrader serve`
+before a reset: a running server keeps trading the old state in memory.
 
 ## Stack
 

@@ -164,6 +164,19 @@ fn to_request(o: &OrderInput) -> Result<OrderRequest, zyris::Error> {
 }
 
 impl TraderTools {
+    /// Parse an id and require a loaded instrument, so typos fail fast and are never subscribed.
+    fn known(&self, raw: &str) -> Result<InstrumentId, zyris::Error> {
+        let id = parse_id(raw)?;
+        if self.app.broker.instrument(&id).is_none() {
+            return Err(coded(
+                "UNKNOWN_INSTRUMENT",
+                format!("no instrument {id}; find ids with search_instruments"),
+                json!({}),
+            ));
+        }
+        Ok(id)
+    }
+
     async fn valuation(&self, account: &str) -> zyris::Result<(AccountSummary, Vec<PositionView>)> {
         let row = self.app.agent_account(account)?;
         let pf = self.app.broker.portfolio(&row.id).ok_or_else(|| order_error(OrderError::UnknownAccount))?;
@@ -291,6 +304,16 @@ impl Trader for TraderTools {
         let ids = ids.iter().map(|s| parse_id(s)).collect::<Result<Vec<_>, _>>()?;
         let mut out = Vec::with_capacity(ids.len());
         for id in &ids {
+            if self.app.broker.instrument(id).is_none() {
+                out.push(Quote {
+                    id: id.to_string(),
+                    currency: id.venue.currency().code().into(),
+                    stale: true,
+                    error: Some("unknown instrument; find ids with search_instruments".into()),
+                    ..Default::default()
+                });
+                continue;
+            }
             let error = self.app.market.ensure_fresh(id).await.err().map(|e| format!("{e:#}"));
             out.push(self.quote(id, error));
         }
@@ -298,7 +321,7 @@ impl Trader for TraderTools {
     }
 
     async fn get_orderbook(&self, id: String, depth: Option<u32>) -> zyris::Result<OrderBook> {
-        let id = parse_id(&id)?;
+        let id = self.known(&id)?;
         let depth = depth.unwrap_or(10).clamp(1, 30) as usize;
         self.app.market.ensure_fresh(&id).await.map_err(|e| upstream(format!("{e:#}")))?;
         let v = self.app.broker.book_view(&id, depth).ok_or_else(|| order_error(OrderError::UnknownInstrument))?;
@@ -318,6 +341,7 @@ impl Trader for TraderTools {
     async fn estimate_order(&self, order: OrderInput) -> zyris::Result<EstimateView> {
         let row = self.app.agent_account(&order.account)?;
         let req = to_request(&order)?;
+        self.known(&order.instrument)?;
         self.app.market.ensure_fresh(&req.instrument).await.map_err(|e| upstream(format!("{e:#}")))?;
         self.app.broker.estimate(&row.id, &req).map(EstimateView::from).map_err(order_error)
     }
@@ -325,6 +349,7 @@ impl Trader for TraderTools {
     async fn place_order(&self, order: OrderInput) -> zyris::Result<PlaceResult> {
         let row = self.app.agent_account(&order.account)?;
         let req = to_request(&order)?;
+        self.known(&order.instrument)?;
         self.app.market.ensure_fresh(&req.instrument).await.map_err(|e| upstream(format!("{e:#}")))?;
         let (placed, fills) = self.app.broker.place_sync(&row.id, req).map_err(order_error)?;
         self.app.market.refresh_pins();

@@ -62,12 +62,12 @@ async fn rig(pool: PgPool) -> (Arc<App>, TraderTools) {
     store.create_account("manual", "Manual", None, &[(Currency::Krw, dec!(1000000000))], Utc::now()).await.unwrap();
     let (jtx, jrx) = mpsc::unbounded_channel();
     let broker = Arc::new(SimBroker::new(Arc::new(clock.clone()), Calendar::default()).with_journal(jtx));
-    restore(&store, &broker).await.unwrap();
+    let generations = restore(&store, &broker).await.unwrap();
     let (bus, _) = broadcast::channel(64);
     let mut market = Market::new(broker.clone());
     let _subs = market.add_feed(Arc::new(Fake { clock }), 10);
     market.load_instruments().await.unwrap();
-    tokio::spawn(persist(jrx, store.clone(), bus));
+    tokio::spawn(persist(jrx, store.clone(), bus, generations));
     let app = Arc::new(App::new(broker, store, market, FxCache::fixed(dec!(1400))).await.unwrap());
     (app.clone(), TraderTools::new(app))
 }
@@ -233,7 +233,21 @@ async fn restart_restores_cash_positions_and_open_orders(pool: PgPool) {
 
     let clock = ManualClock::new(Utc.with_ymd_and_hms(2026, 9, 23, 1, 0, 0).unwrap());
     let fresh = SimBroker::new(Arc::new(clock), Calendar::default());
-    assert_eq!(restore(&app.store, &fresh).await.unwrap(), 2);
+    assert_eq!(restore(&app.store, &fresh).await.unwrap().len(), 2);
     assert_eq!(fresh.portfolio("bot").unwrap(), before);
     assert_eq!(fresh.order(resting.id).unwrap().status, atrader::broker::OrderStatus::Open);
+}
+
+#[sqlx::test]
+async fn unknown_instruments_are_not_retriable_and_not_subscribed(pool: PgPool) {
+    let (_, t) = rig(pool).await;
+    for id in ["UPBIT:KRW-NOPE", "KRX:005930"] {
+        let mut o = buy("bot", Some(dec!(1)), "why");
+        o.instrument = id.into();
+        let e = t.estimate_order(o).await.unwrap_err();
+        assert_eq!((code(&e), e.retriable), ("UNKNOWN_INSTRUMENT".to_string(), false), "{id}");
+        assert_eq!(code(&t.get_orderbook(id.into(), None).await.unwrap_err()), "UNKNOWN_INSTRUMENT");
+    }
+    let q = t.get_quotes(vec!["UPBIT:KRW-NOPE".into()]).await.unwrap();
+    assert!(q[0].error.as_deref().unwrap_or("").contains("unknown"));
 }

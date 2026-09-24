@@ -198,7 +198,7 @@ pub struct SimBroker {
     staleness: Duration,
     // ponytail: one global lock over the simulated world; per-instrument actors (spec §13) if order rate needs it.
     world: Mutex<World>,
-    journal: Option<mpsc::UnboundedSender<Journal>>,
+    journal: Mutex<Option<mpsc::UnboundedSender<Journal>>>,
 }
 
 /// The result of validating an order against the current shadow book.
@@ -307,15 +307,20 @@ fn release(w: &mut World, order: &Order, qty: Decimal) {
 
 impl SimBroker {
     /// Send every persisted-state change to `tx` (see `Journal`).
-    pub fn with_journal(mut self, tx: mpsc::UnboundedSender<Journal>) -> Self {
-        self.journal = Some(tx);
+    pub fn with_journal(self, tx: mpsc::UnboundedSender<Journal>) -> Self {
+        *self.journal.lock().unwrap() = Some(tx);
         self
     }
 
     fn emit(&self, j: Journal) {
-        if let Some(tx) = &self.journal {
+        if let Some(tx) = &*self.journal.lock().unwrap() {
             let _ = tx.send(j);
         }
+    }
+
+    /// Stop journaling. The writer drains what is queued and then ends (graceful shutdown).
+    pub fn close_journal(&self) {
+        self.journal.lock().unwrap().take();
     }
 
     /// Take a resting order off the book with `status`, returning its reservation.
@@ -340,7 +345,7 @@ impl SimBroker {
             calendar,
             staleness: Duration::seconds(5),
             world: Mutex::new(World { next_order_id: 1, ..Default::default() }),
-            journal: None,
+            journal: Mutex::new(None),
         }
     }
 
