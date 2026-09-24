@@ -318,13 +318,15 @@ impl Store {
         rows.iter().map(parse_fill).collect()
     }
 
+    /// A bar saved again for the same minute (a late print after the flush) is merged in.
     pub async fn save_bars(&self, bars: &[(InstrumentId, Candle)]) -> sqlx::Result<()> {
         let mut tx = self.pool.begin().await?;
         for (id, c) in bars {
             sqlx::query(
                 "INSERT INTO bars (instrument, start, open, high, low, close, volume, value) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-                 ON CONFLICT (instrument, start) DO UPDATE SET open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low,
-                     close = EXCLUDED.close, volume = EXCLUDED.volume, value = EXCLUDED.value",
+                 ON CONFLICT (instrument, start) DO UPDATE SET high = GREATEST(bars.high, EXCLUDED.high),
+                     low = LEAST(bars.low, EXCLUDED.low), close = EXCLUDED.close,
+                     volume = bars.volume + EXCLUDED.volume, value = bars.value + EXCLUDED.value",
             )
             .bind(id.to_string())
             .bind(c.start)
@@ -378,15 +380,17 @@ impl Store {
         Ok(())
     }
 
-    /// Oldest first; `since` inclusive.
-    pub async fn snapshots(&self, account: &str, generation: i32, since: Option<DateTime<Utc>>) -> sqlx::Result<Vec<Snapshot>> {
+    /// Oldest first; `since` inclusive. `daily_only` skips the per-minute rows (1,440 a day).
+    pub async fn snapshots(&self, account: &str, generation: i32, since: Option<DateTime<Utc>>, daily_only: bool) -> sqlx::Result<Vec<Snapshot>> {
         let rows = sqlx::query(
             "SELECT * FROM equity_snapshots WHERE account_id = $1 AND generation = $2 AND ($3::timestamptz IS NULL OR at >= $3)
+               AND (NOT $4 OR kind = 'daily')
              ORDER BY at, kind",
         )
         .bind(account)
         .bind(generation)
         .bind(since)
+        .bind(daily_only)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows

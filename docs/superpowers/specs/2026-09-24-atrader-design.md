@@ -214,7 +214,7 @@ decay within minutes anyway.
   `(price − avg_cost) × qty − fees − taxes`, in the instrument's currency and also converted to
   KRW at the fill-time rate.
 - **Equity snapshots:**
-  - Every minute while any market holding a position is open.
+  - Every minute (crypto trades around the clock, so there is always a market open).
   - Once a day at 00:00 KST as the daily close.
   - Daily PnL is the change from one daily close to the next.
 - **Reset:** `generation` goes up and fresh initial cash is deposited. Old rows are kept and

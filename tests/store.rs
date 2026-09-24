@@ -222,6 +222,35 @@ async fn bars_and_snapshots_round_trip(pool: PgPool) {
     store.create_account("a", "Test", None, &[(Currency::Krw, dec!(1))], Utc::now()).await.unwrap();
     let s = Snapshot { account: "a".into(), generation: 1, at: at(5), kind: SnapshotKind::Daily, equity_krw: dec!(10), cash_krw: dec!(4), positions_krw: dec!(6) };
     store.save_snapshot(&s).await.unwrap();
-    assert_eq!(store.snapshots("a", 1, None).await.unwrap(), vec![s.clone()]);
-    assert!(store.snapshots("a", 1, Some(at(6))).await.unwrap().is_empty());
+    assert_eq!(store.snapshots("a", 1, None, false).await.unwrap(), vec![s.clone()]);
+    assert!(store.snapshots("a", 1, Some(at(6)), false).await.unwrap().is_empty());
+}
+
+#[sqlx::test]
+async fn late_bar_fragments_merge_instead_of_overwriting(pool: PgPool) {
+    use atrader::candles::Candle;
+    use chrono::TimeZone;
+    let store = Store::new(pool);
+    let id: InstrumentId = "KRX:005930".parse().unwrap();
+    let start = Utc.with_ymd_and_hms(2026, 9, 23, 1, 0, 0).unwrap();
+    let full = Candle { start, open: dec!(100), high: dec!(105), low: dec!(99), close: dec!(104), volume: dec!(10), value: dec!(1020) };
+    let late = Candle { start, open: dec!(103), high: dec!(103), low: dec!(103), close: dec!(103), volume: dec!(1), value: dec!(103) };
+    store.save_bars(&[(id.clone(), full)]).await.unwrap();
+    store.save_bars(&[(id.clone(), late)]).await.unwrap();
+    let b = store.bars(&id, start).await.unwrap();
+    assert_eq!((b[0].open, b[0].high, b[0].low, b[0].close), (dec!(100), dec!(105), dec!(99), dec!(103)));
+    assert_eq!((b[0].volume, b[0].value), (dec!(11), dec!(1123)));
+}
+
+#[sqlx::test]
+async fn daily_snapshots_can_be_read_alone(pool: PgPool) {
+    use atrader::performance::{Snapshot, SnapshotKind};
+    let store = Store::new(pool);
+    store.create_account("a", "Test", None, &[(Currency::Krw, dec!(1))], Utc::now()).await.unwrap();
+    for (kind, secs) in [(SnapshotKind::Minute, 0), (SnapshotKind::Daily, 1), (SnapshotKind::Minute, 2)] {
+        let s = Snapshot { account: "a".into(), generation: 1, at: Utc::now() + chrono::Duration::seconds(secs), kind, equity_krw: dec!(1), cash_krw: dec!(1), positions_krw: dec!(0) };
+        store.save_snapshot(&s).await.unwrap();
+    }
+    assert_eq!(store.snapshots("a", 1, None, true).await.unwrap().len(), 1);
+    assert_eq!(store.snapshots("a", 1, None, false).await.unwrap().len(), 3);
 }

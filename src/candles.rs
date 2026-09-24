@@ -64,11 +64,18 @@ impl Interval {
     }
 
     /// Bucket start for `t`. Weeks start Monday 00:00 UTC (the Unix epoch was a Thursday).
-    fn bucket(self, t: DateTime<Utc>) -> DateTime<Utc> {
+    pub fn bucket(self, t: DateTime<Utc>) -> DateTime<Utc> {
         let offset = if self == Interval::W1 { 3 * 86400 } else { 0 };
         let s = t.timestamp() + offset;
         DateTime::from_timestamp(s - s.rem_euclid(self.secs()) - offset, 0).expect("in range")
     }
+}
+
+/// Where to start reading stored 1-minute bars for `limit` candles of `interval`: three times
+/// the span (to absorb closed hours), snapped back to a bucket boundary so the first candle is
+/// whole.
+pub fn lookback_start(now: DateTime<Utc>, interval: Interval, limit: usize) -> DateTime<Utc> {
+    interval.bucket(now - chrono::Duration::seconds(interval.secs() * limit as i64 * 3))
 }
 
 /// Merge candles (oldest first) into `interval` buckets.
@@ -184,5 +191,13 @@ mod tests {
         assert_eq!(flushed.len(), 1);
         assert_eq!(flushed[0].1.start, t(1, 1, 0));
         assert!(b.flush_before(t(1, 3, 0)).is_empty());
+    }
+
+    #[test]
+    fn stored_bar_lookback_starts_on_a_bucket_boundary() {
+        let now = t(1, 7, 30);
+        let start = lookback_start(now, Interval::M5, 2); // 1:07:30 - 30 min = 0:37:30
+        assert_eq!(start, t(0, 35, 0));
+        assert_eq!(lookback_start(now, Interval::H1, 1), t(22, 0, 0) - chrono::Duration::days(1));
     }
 }

@@ -80,8 +80,8 @@ pub trait Trader {
     async fn convert_currency(&self, account: String, from: String, to: String, amount: Decimal) -> zyris::Result<ConversionView>;
 
     /// OHLCV candles, oldest first (the last may still be forming). `interval`: 1m, 5m, 15m, 1h,
-    /// 1d, 1w. `limit` default 100, at most 200. KRX/US minute candles exist only for periods
-    /// when ATrader was streaming that stock.
+    /// 1d, 1w. `limit` default 100, at most 200; KRX/US daily and weekly candles return at most
+    /// 100. KRX/US minute candles exist only for periods when ATrader was streaming that stock.
     async fn get_candles(&self, id: String, interval: String, limit: Option<u32>) -> zyris::Result<Vec<CandleView>>;
 
     /// Technical indicators computed on the server from candles. `indicators`: up to 8 of
@@ -197,7 +197,7 @@ fn to_request(o: &OrderInput) -> Result<OrderRequest, zyris::Error> {
 impl TraderTools {
     async fn candles(&self, id: &InstrumentId, interval: Interval, limit: usize) -> zyris::Result<Vec<Candle>> {
         if interval.is_intraday() && id.venue.has_session() {
-            let since = self.app.broker.now() - chrono::Duration::seconds(interval.secs() * limit as i64 * 3);
+            let since = crate::candles::lookback_start(self.app.broker.now(), interval, limit);
             let bars = self.app.store.bars(id, since).await.map_err(upstream)?;
             let mut out = resample(&bars, interval);
             let skip = out.len().saturating_sub(limit);
@@ -498,7 +498,8 @@ impl Trader for TraderTools {
             _ => return Err(bad("period must be 1d, 1w, 1m, 3m or all")),
         };
         let since = days.map(|d| self.app.broker.now() - chrono::Duration::days(d));
-        let snaps = self.app.store.snapshots(&row.id, row.generation, since).await.map_err(upstream)?;
+        // Minute rows only matter for a single day; longer periods use the daily closes.
+        let snaps = self.app.store.snapshots(&row.id, row.generation, since, days.is_some_and(|d| d > 1)).await.map_err(upstream)?;
         let fills = self.app.store.fills(&row.id, row.generation, since, 100_000).await.map_err(upstream)?;
         let usd_krw = self.app.fx.usd_krw().await.map_err(|e| upstream(format!("{e:#}")))?;
         let p = performance(&snaps, &fills, usd_krw);
