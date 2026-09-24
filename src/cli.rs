@@ -34,6 +34,9 @@ ENVIRONMENT:
   ZYRIS_CREDENTIAL_FILE file holding it
   ZYRIS_SERVER_URL      zyris server (default: Attacca's)
   ATRADER_NODE_NAME     node name shown in Attacca (default: atrader)
+  KIS_APP_KEY, KIS_APP_SECRET  KIS Open API keys (enable KRX and US stocks)
+  KIS_ENV               `mock` for KIS mock-trading hosts (default: real)
+  ATRADER_STATE_DIR     where the KIS token is cached (default: ~/.local/state/atrader)
   RUST_LOG              log filter (default: atrader=info,zyris_core=info)";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -177,8 +180,19 @@ async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
     let mut market = Market::new(broker.clone());
 
     let (events_tx, events_rx) = mpsc::channel(4096);
-    let feeds: Vec<(Arc<dyn MarketFeed>, usize)> =
+    let mut feeds: Vec<(Arc<dyn MarketFeed>, usize)> =
         vec![(Arc::new(UpbitFeed::new(clock.clone())), 50), (Arc::new(BinanceFeed::new(clock.clone())), 100)];
+    match crate::feed::kis::KisConfig::from_env() {
+        Some(cfg) => {
+            let client = Arc::new(crate::feed::kis::KisClient::new(cfg));
+            let calendar = Calendar::from_toml(include_str!("../holidays.toml"))?;
+            // 41 real-time registrations per appkey; book + trade = 2 per instrument.
+            feeds.push((Arc::new(crate::feed::kis::KisKrxFeed::new(client.clone(), clock.clone(), calendar.clone())), 10));
+            feeds.push((Arc::new(crate::feed::kis::KisUsFeed::new(client, clock.clone(), calendar)), 10));
+        }
+        None => tracing::info!("KIS_APP_KEY/KIS_APP_SECRET not set; KRX and US stocks are disabled"),
+    }
+
     for (feed, cap) in feeds {
         let subs = market.add_feed(feed.clone(), cap);
         tokio::spawn(run_feed(feed, subs, events_tx.clone()));

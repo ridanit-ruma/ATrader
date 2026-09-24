@@ -56,3 +56,33 @@ async fn fx_live() {
     let rate = FxCache::new().usd_krw().await.unwrap();
     assert!(rate > rust_decimal::Decimal::from(500) && rate < rust_decimal::Decimal::from(5000), "rate {rate}");
 }
+
+fn kis() -> Option<Arc<atrader::feed::kis::KisClient>> {
+    atrader::feed::kis::KisConfig::from_env().map(|c| Arc::new(atrader::feed::kis::KisClient::new(c)))
+}
+
+#[tokio::test]
+#[ignore]
+async fn kis_krx_live() {
+    let Some(client) = kis() else { return eprintln!("KIS keys not set; skipped") };
+    let cal = atrader::venue::Calendar::from_toml(include_str!("../holidays.toml")).unwrap();
+    let feed = Arc::new(atrader::feed::kis::KisKrxFeed::new(client, Arc::new(SystemClock), cal));
+    let id: InstrumentId = "KRX:005930".parse().unwrap();
+    assert!(feed.instruments().await.unwrap().iter().any(|i| i.id == id));
+    let book = feed.snapshot(&id).await.unwrap();
+    assert!(book.prev_close.is_some() && !book.asks.is_empty(), "{book:?}");
+    assert!(feed.daily_stats(&id).await.unwrap().sigma > 0.0);
+}
+
+#[tokio::test]
+#[ignore]
+async fn kis_us_live() {
+    let Some(client) = kis() else { return eprintln!("KIS keys not set; skipped") };
+    let cal = atrader::venue::Calendar::from_toml(include_str!("../holidays.toml")).unwrap();
+    let feed = Arc::new(atrader::feed::kis::KisUsFeed::new(client, Arc::new(SystemClock), cal));
+    let id: InstrumentId = "US:AAPL".parse().unwrap();
+    assert!(feed.instruments().await.unwrap().iter().any(|i| i.id == id));
+    let book = feed.snapshot(&id).await.unwrap();
+    assert!(!book.bids.is_empty() || !book.asks.is_empty(), "{book:?}");
+    assert!(feed.daily_stats(&id).await.unwrap().sigma > 0.0);
+}

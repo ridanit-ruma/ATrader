@@ -1,8 +1,23 @@
 //! Korea Investment & Securities (KIS) Open API: KRX and US stock market data.
 
 pub mod master;
+pub mod rest;
 pub mod ws;
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex};
+
+use async_trait::async_trait;
+use chrono::NaiveDate;
+use futures_util::SinkExt;
+use rust_decimal::Decimal;
+use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::Message;
+
+use crate::domain::{Book, Clock, InstrumentId, Venue};
+use crate::feed::{MarketEvent, MarketFeed, next_or_idle};
+use crate::sim::DailyStats;
+use crate::venue::{Calendar, Instrument};
 use std::path::{Path, PathBuf};
 use std::time::{Duration as StdDuration, Instant};
 
@@ -213,6 +228,245 @@ impl KisClient {
     }
 }
 
+/// Stream `subs` (tr_id, tr_key) pairs from the KIS WebSocket into `tx`, turning records into
+/// events via `on_event`. Returns an error on disconnect or idle so the runner reconnects.
+async fn stream_ws(
+    client: &KisClient,
+    subs: &[(&str, String)],
+    tx: &mpsc::Sender<MarketEvent>,
+    clock: &dyn Clock,
+    mut on_event: impl FnMut(&mut MarketEvent),
+) -> anyhow::Result<()> {
+    let key = client.approval_key().await?;
+    let (mut ws, _) = tokio_tungstenite::connect_async(client.config().ws_url()).await?;
+    for (tr_id, tr_key) in subs {
+        ws.send(Message::text(ws::subscribe_message(&key, tr_id, tr_key))).await?;
+    }
+    loop {
+        let text = match next_or_idle(&mut ws, "kis").await?? {
+            Message::Text(t) => t.as_str().to_string(),
+            Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
+            Message::Close(_) => anyhow::bail!("kis websocket closed"),
+            _ => continue,
+        };
+        match ws::parse_frame(&text) {
+            Ok(ws::Frame::Ping(raw)) => ws.send(Message::text(raw)).await?,
+            Ok(ws::Frame::Ack { ok: false, tr_id, msg }) => tracing::warn!(%tr_id, %msg, "KIS subscription refused"),
+            Ok(ws::Frame::Data { tr_id, records }) => {
+                for rec in records {
+                    if let Some(mut ev) = ws::record_event(&tr_id, &rec, clock.now()) {
+                        on_event(&mut ev);
+                        if tx.send(ev).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::debug!(error = %e, "skipping unreadable KIS frame"),
+        }
+    }
+}
+
+/// Outside the venue's session there is nothing to stream: wait for the next open.
+async fn wait_for_session(calendar: &Calendar, clock: &dyn Clock, venue: Venue) {
+    let now = clock.now();
+    if calendar.is_open(venue, now) {
+        return;
+    }
+    if let Some(open) = calendar.next_open(venue, now) {
+        let wait = (open - now).to_std().unwrap_or_default();
+        tracing::info!(venue = venue.tag(), %open, "market closed; KIS stream waits for the open");
+        tokio::time::sleep(wait).await;
+    }
+}
+
+async fn download_master(client: &reqwest::Client, file: &str) -> anyhow::Result<Vec<u8>> {
+    let zip = client.get(format!("{}/{file}.zip", master::MASTER_BASE)).send().await?.error_for_status()?.bytes().await?;
+    master::unzip_first(&zip)
+}
+
+pub struct KisKrxFeed {
+    client: Arc<KisClient>,
+    clock: Arc<dyn Clock>,
+    calendar: Calendar,
+    prev_close: StdMutex<HashMap<InstrumentId, (NaiveDate, Decimal)>>,
+}
+
+impl KisKrxFeed {
+    pub fn new(client: Arc<KisClient>, clock: Arc<dyn Clock>, calendar: Calendar) -> Self {
+        KisKrxFeed { client, clock, calendar, prev_close: StdMutex::new(HashMap::new()) }
+    }
+
+    fn today(&self) -> NaiveDate {
+        self.clock.now().with_timezone(&chrono_tz::Asia::Seoul).date_naive()
+    }
+
+    pub fn remember_prev_close(&self, id: &InstrumentId, price: Decimal) {
+        self.prev_close.lock().unwrap().insert(id.clone(), (self.today(), price));
+    }
+
+    pub fn attach_prev_close(&self, book: &mut Book) {
+        let today = self.today();
+        if let Some((day, p)) = self.prev_close.lock().unwrap().get(&book.instrument) {
+            if *day == today {
+                book.prev_close = Some(*p);
+            }
+        }
+    }
+
+    /// Today's previous close for `id`, fetched once per KST day.
+    async fn ensure_prev_close(&self, id: &InstrumentId) -> anyhow::Result<()> {
+        let fresh = self.prev_close.lock().unwrap().get(id).is_some_and(|(d, _)| *d == self.today());
+        if !fresh {
+            let body = self
+                .client
+                .get("/uapi/domestic-stock/v1/quotations/inquire-price", "FHKST01010100", &[("FID_COND_MRKT_DIV_CODE", "J"), ("FID_INPUT_ISCD", &id.symbol)])
+                .await?;
+            self.remember_prev_close(id, rest::krx_prev_close(&body)?);
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl MarketFeed for KisKrxFeed {
+    fn venue(&self) -> Venue {
+        Venue::Krx
+    }
+
+    async fn instruments(&self) -> anyhow::Result<Vec<Instrument>> {
+        let http = reqwest::Client::new();
+        let mut out = master::parse_krx_master(&download_master(&http, "kospi_code.mst").await?);
+        out.extend(master::parse_krx_master(&download_master(&http, "kosdaq_code.mst").await?));
+        Ok(out)
+    }
+
+    async fn snapshot(&self, id: &InstrumentId) -> anyhow::Result<Book> {
+        self.ensure_prev_close(id).await?;
+        let body = self
+            .client
+            .get(
+                "/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn",
+                "FHKST01010200",
+                &[("FID_COND_MRKT_DIV_CODE", "J"), ("FID_INPUT_ISCD", &id.symbol)],
+            )
+            .await?;
+        let mut book = rest::krx_book(&id.symbol, &body, self.clock.now())?;
+        self.attach_prev_close(&mut book);
+        Ok(book)
+    }
+
+    async fn daily_stats(&self, id: &InstrumentId) -> anyhow::Result<DailyStats> {
+        let end = self.today();
+        let start = end - chrono::Duration::days(45);
+        let (s, e) = (start.format("%Y%m%d").to_string(), end.format("%Y%m%d").to_string());
+        let body = self
+            .client
+            .get(
+                "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
+                "FHKST03010100",
+                &[
+                    ("FID_COND_MRKT_DIV_CODE", "J"),
+                    ("FID_INPUT_ISCD", &id.symbol),
+                    ("FID_INPUT_DATE_1", &s),
+                    ("FID_INPUT_DATE_2", &e),
+                    ("FID_PERIOD_DIV_CODE", "D"),
+                    ("FID_ORG_ADJ_PRC", "0"),
+                ],
+            )
+            .await?;
+        rest::krx_daily_stats(&body)
+    }
+
+    async fn stream(&self, ids: &[InstrumentId], tx: &mpsc::Sender<MarketEvent>) -> anyhow::Result<()> {
+        wait_for_session(&self.calendar, self.clock.as_ref(), Venue::Krx).await;
+        for id in ids {
+            self.ensure_prev_close(id).await?;
+        }
+        let subs: Vec<(&str, String)> =
+            ids.iter().flat_map(|i| [(ws::KRX_BOOK, i.symbol.clone()), (ws::KRX_TRADE, i.symbol.clone())]).collect();
+        stream_ws(&self.client, &subs, tx, self.clock.as_ref(), |ev| {
+            if let MarketEvent::Book(b) = ev {
+                self.attach_prev_close(b);
+            }
+        })
+        .await
+    }
+}
+
+pub struct KisUsFeed {
+    client: Arc<KisClient>,
+    clock: Arc<dyn Clock>,
+    calendar: Calendar,
+    exchanges: StdMutex<HashMap<String, String>>,
+}
+
+impl KisUsFeed {
+    pub fn new(client: Arc<KisClient>, clock: Arc<dyn Clock>, calendar: Calendar) -> Self {
+        KisUsFeed { client, clock, calendar, exchanges: StdMutex::new(HashMap::new()) }
+    }
+
+    fn excd(&self, id: &InstrumentId) -> anyhow::Result<String> {
+        self.exchanges.lock().unwrap().get(&id.symbol).cloned().ok_or_else(|| anyhow!("no exchange known for {id}"))
+    }
+}
+
+#[async_trait]
+impl MarketFeed for KisUsFeed {
+    fn venue(&self) -> Venue {
+        Venue::Us
+    }
+
+    async fn instruments(&self) -> anyhow::Result<Vec<Instrument>> {
+        let http = reqwest::Client::new();
+        let mut out = Vec::new();
+        let mut map = HashMap::new();
+        for file in ["nasmst.cod", "nysmst.cod", "amsmst.cod"] {
+            for (inst, excd) in master::parse_us_master(&download_master(&http, file).await?) {
+                if map.insert(inst.id.symbol.clone(), excd).is_none() {
+                    out.push(inst);
+                }
+            }
+        }
+        *self.exchanges.lock().unwrap() = map;
+        Ok(out)
+    }
+
+    async fn snapshot(&self, id: &InstrumentId) -> anyhow::Result<Book> {
+        let excd = self.excd(id)?;
+        let body = self
+            .client
+            .get("/uapi/overseas-price/v1/quotations/inquire-asking-price", "HHDFS76200100", &[("AUTH", ""), ("EXCD", &excd), ("SYMB", &id.symbol)])
+            .await?;
+        rest::us_book(&id.symbol, &body, self.clock.now())
+    }
+
+    async fn daily_stats(&self, id: &InstrumentId) -> anyhow::Result<DailyStats> {
+        let excd = self.excd(id)?;
+        let body = self
+            .client
+            .get(
+                "/uapi/overseas-price/v1/quotations/dailyprice",
+                "HHDFS76240000",
+                &[("AUTH", ""), ("EXCD", &excd), ("SYMB", &id.symbol), ("GUBN", "0"), ("BYMD", ""), ("MODP", "1")],
+            )
+            .await?;
+        rest::us_daily_stats(&body)
+    }
+
+    async fn stream(&self, ids: &[InstrumentId], tx: &mpsc::Sender<MarketEvent>) -> anyhow::Result<()> {
+        wait_for_session(&self.calendar, self.clock.as_ref(), Venue::Us).await;
+        let mut subs = Vec::new();
+        for id in ids {
+            let key = ws::us_tr_key(&self.excd(id)?, &id.symbol);
+            subs.push((ws::US_BOOK, key.clone()));
+            subs.push((ws::US_TRADE, key));
+        }
+        stream_ws(&self.client, &subs, tx, self.clock.as_ref(), |_| {}).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,5 +527,17 @@ mod tests {
         let e = check_rt(&body, "FHKST01010100").unwrap_err().to_string();
         assert!(e.contains("EGW00201") && e.contains("FHKST01010100"), "{e}");
         assert!(check_rt(&serde_json::json!({"rt_cd": "0"}), "x").is_ok());
+    }
+    #[test]
+    fn krx_books_get_the_cached_prev_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = Arc::new(KisClient::new(cfg(dir.path())));
+        let clock = Arc::new(crate::domain::ManualClock::new(Utc.with_ymd_and_hms(2026, 9, 23, 1, 0, 0).unwrap()));
+        let feed = KisKrxFeed::new(client, clock, crate::venue::Calendar::default());
+        let id: InstrumentId = "KRX:005930".parse().unwrap();
+        feed.remember_prev_close(&id, rust_decimal_macros::dec!(69800));
+        let mut book = Book { instrument: id, bids: vec![], asks: vec![], prev_close: None, received_at: Utc::now() };
+        feed.attach_prev_close(&mut book);
+        assert_eq!(book.prev_close, Some(rust_decimal_macros::dec!(69800)));
     }
 }
