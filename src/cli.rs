@@ -166,6 +166,7 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
                 let user = auth.user_by_name(&username).await?.ok_or_else(|| anyhow!("no user {username}"))?;
                 auth.set_totp(user.id, None, false).await?;
                 auth.save_recovery_codes(user.id, &[]).await?;
+                auth.delete_user_sessions(user.id).await?;
                 println!("two-factor authentication cleared for {username}; it is enrolled again at the next login");
             }
             Command::AccountReset { id, cash } => {

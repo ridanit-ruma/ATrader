@@ -4,6 +4,8 @@ CREATE TABLE users (
     password_hash TEXT NOT NULL,
     totp_secret   TEXT,
     totp_enabled  BOOLEAN NOT NULL DEFAULT false,
+    -- Last accepted TOTP time step; a code is never accepted twice.
+    totp_last_step BIGINT NOT NULL DEFAULT 0,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

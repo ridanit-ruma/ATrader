@@ -978,7 +978,10 @@ async fn login(State(s): State<WebState>, ConnectInfo(peer): ConnectInfo<SocketA
     let second_ok = match (&user, password_ok) {
         (Some(u), true) if u.totp_enabled => {
             let code = b.code.as_deref().unwrap_or_default();
-            u.totp_secret.as_deref().is_some_and(|sec| auth::check_totp(sec, code, now)) || s.auth.use_recovery_code(u.id, code).await.map_err(internal)?
+            match u.totp_secret.as_deref() {
+                Some(sec) if s.auth.accept_totp(u.id, sec, code, now).await.map_err(internal)? => true,
+                _ => s.auth.use_recovery_code(u.id, code).await.map_err(internal)?,
+            }
         }
         (Some(_), true) => true, // not enrolled yet: the session starts pending
         _ => false,
@@ -1011,8 +1014,8 @@ async fn login(State(s): State<WebState>, ConnectInfo(peer): ConnectInfo<SocketA
   - Then the `AuthStore` call.
   - Then `audit(...)` for state changes.
   - `totp_setup` stores the new secret with `enabled = false`.
-  - `totp_enable` verifies the code against the stored secret, then calls `set_totp(.., true)`, `save_recovery_codes(new_recovery_codes())` and `upgrade_session`, and returns the codes.
-  - `password` checks `current`, requires at least 12 characters, calls `set_password(hash_password(new))`, and deletes every other session.
+  - `totp_enable` verifies the code with `accept_totp` against the stored secret, then calls `set_totp(.., true)` and `save_recovery_codes(new_recovery_codes())`. It then **rotates the session**: it deletes the pending session, creates a fresh full session with a new token and sets it as the cookie, so a token issued before the second factor never becomes a full session. It returns the codes.
+  - `password` checks `current`, requires at least 12 characters, calls `set_password(hash_password(new))`, calls `delete_user_sessions`, and issues a fresh session cookie for the caller.
   - `revoke` takes the `id_hash` from `sessions`.
 - **Account handlers:**
   - `create_account` validates the id against `^[a-z0-9_-]{1,32}$` (a manual char check) and `cash` as a map of `{KRW|USD|USDT: decimal ≥ 0}` (else 400). It calls `app.create_account`; a duplicate id (a unique violation) is 409. It audits `account_create`.

@@ -26,3 +26,19 @@ async fn sessions_expire_and_recovery_codes_are_single_use(pool: PgPool) {
     s.audit(Some(uid), "login", "ok", "1.2.3.4").await.unwrap();
     assert_eq!(s.audit_log(10).await.unwrap().len(), 1);
 }
+
+#[sqlx::test]
+async fn totp_codes_are_single_use_and_resets_end_sessions(pool: PgPool) {
+    let s = AuthStore(pool);
+    let uid = s.create_user("ruma", &hash_password("long enough pass")).await.unwrap();
+    let secret = new_totp_secret();
+    s.set_totp(uid, Some(&secret), true).await.unwrap();
+    let now = Utc::now();
+    let code = current_code_for_tests(&secret, now);
+    assert!(s.accept_totp(uid, &secret, &code, now).await.unwrap());
+    assert!(!s.accept_totp(uid, &secret, &code, now).await.unwrap()); // replay
+    let tok = new_token();
+    s.create_session(uid, &token_hash(&tok), false, "ip", "ua", now).await.unwrap();
+    s.delete_user_sessions(uid).await.unwrap();
+    assert!(s.session(&token_hash(&tok), now).await.unwrap().is_none());
+}

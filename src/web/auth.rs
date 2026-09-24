@@ -46,6 +46,17 @@ pub fn current_code_for_tests(secret: &str, now: DateTime<Utc>) -> String {
     totp(secret, "u").expect("valid secret").generate(now.timestamp() as u64)
 }
 
+/// The 30 s time step `code` belongs to (current, previous or next), if it is valid.
+pub fn totp_step(secret: &str, code: &str, now: DateTime<Utc>) -> Option<i64> {
+    let code = code.trim();
+    if code.len() != 6 || !code.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let t = totp(secret, "u")?;
+    let step = now.timestamp() / 30;
+    [step, step - 1, step + 1].into_iter().find(|s| t.generate((*s * 30) as u64) == code)
+}
+
 pub fn new_token() -> String {
     let mut b = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut b);
@@ -137,6 +148,23 @@ impl AuthStore {
 
     pub async fn set_totp(&self, user_id: i64, secret: Option<&str>, enabled: bool) -> sqlx::Result<()> {
         sqlx::query("UPDATE users SET totp_secret = $2, totp_enabled = $3 WHERE id = $1").bind(user_id).bind(secret).bind(enabled).execute(&self.0).await?;
+        Ok(())
+    }
+
+    /// Accept a TOTP code once: its time step must be newer than the last accepted one.
+    pub async fn accept_totp(&self, user_id: i64, secret: &str, code: &str, now: DateTime<Utc>) -> sqlx::Result<bool> {
+        let Some(step) = totp_step(secret, code, now) else { return Ok(false) };
+        let done = sqlx::query("UPDATE users SET totp_last_step = $2 WHERE id = $1 AND totp_last_step < $2")
+            .bind(user_id)
+            .bind(step)
+            .execute(&self.0)
+            .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    /// End every session of a user (after a password or second-factor reset).
+    pub async fn delete_user_sessions(&self, user_id: i64) -> sqlx::Result<()> {
+        sqlx::query("DELETE FROM user_sessions WHERE user_id = $1").bind(user_id).execute(&self.0).await?;
         Ok(())
     }
 
