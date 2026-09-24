@@ -12,6 +12,8 @@ use crate::domain::{Currency, InstrumentId, Side};
 use crate::ledger::Portfolio;
 use crate::sim::Size;
 use crate::candles::Candle;
+use crate::alerts::{Alert, Condition};
+use crate::domain::Venue;
 use crate::performance::{Snapshot, SnapshotKind};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -89,6 +91,24 @@ fn parse_fill(r: &sqlx::postgres::PgRow) -> sqlx::Result<Fill> {
         realized_pnl: r.get("realized_pnl"),
         liquidity,
         at: r.get("at"),
+    })
+}
+
+fn parse_alert(r: &sqlx::postgres::PgRow) -> sqlx::Result<Alert> {
+    let kind: String = r.get("kind");
+    let instrument = r.get::<Option<String>, _>("instrument").map(|s| s.parse::<InstrumentId>()).transpose().map_err(decode_err)?;
+    let venue = r.get::<Option<String>, _>("venue").and_then(|v| Venue::from_tag(&v));
+    let window = r.get::<Option<i32>, _>("window_minutes").map(|w| w as u32);
+    let condition = Condition::from_parts(&kind, instrument, venue, r.get("threshold"), window).ok_or_else(|| decode_err(format!("incomplete {kind} alert")))?;
+    Ok(Alert {
+        id: r.get("id"),
+        account: r.get("account_id"),
+        generation: r.get("generation"),
+        condition,
+        note: r.get("note"),
+        once: r.get("once"),
+        created_at: r.get("created_at"),
+        last_fired_at: r.get("last_fired_at"),
     })
 }
 
@@ -405,6 +425,97 @@ impl Store {
                 positions_krw: r.get("positions_krw"),
             })
             .collect())
+    }
+
+    pub async fn create_alert(&self, a: &Alert) -> sqlx::Result<i64> {
+        let c = &a.condition;
+        sqlx::query_scalar(
+            "INSERT INTO alerts (account_id, generation, kind, instrument, venue, threshold, window_minutes, note, once, created_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id",
+        )
+        .bind(&a.account)
+        .bind(a.generation)
+        .bind(c.kind())
+        .bind(c.instrument().map(|i| i.to_string()))
+        .bind(c.venue().map(|v| v.tag()))
+        .bind(c.threshold())
+        .bind(c.window_minutes().map(|w| w as i32))
+        .bind(&a.note)
+        .bind(a.once)
+        .bind(a.created_at)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    pub async fn active_alerts(&self, account: &str, generation: i32) -> sqlx::Result<Vec<Alert>> {
+        let rows = sqlx::query("SELECT * FROM alerts WHERE account_id = $1 AND generation = $2 AND active ORDER BY id")
+            .bind(account)
+            .bind(generation)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(parse_alert).collect()
+    }
+
+    /// Active alerts of every account at the generation it was restored at.
+    pub async fn all_active_alerts(&self, generations: &HashMap<String, i32>) -> sqlx::Result<Vec<Alert>> {
+        let mut out = Vec::new();
+        for (account, generation) in generations {
+            out.extend(self.active_alerts(account, *generation).await?);
+        }
+        Ok(out)
+    }
+
+    /// Turn off `account`'s alert `id`. False when it is not that account's or already off.
+    pub async fn deactivate_alert(&self, account: &str, id: i64) -> sqlx::Result<bool> {
+        let done = sqlx::query("UPDATE alerts SET active = false WHERE id = $1 AND account_id = $2 AND active")
+            .bind(id)
+            .bind(account)
+            .execute(&self.pool)
+            .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    pub async fn mark_fired(&self, id: i64, at: DateTime<Utc>, deactivate: bool) -> sqlx::Result<()> {
+        sqlx::query("UPDATE alerts SET last_fired_at = $2, active = active AND NOT $3 WHERE id = $1")
+            .bind(id)
+            .bind(at)
+            .bind(deactivate)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn record_alert_event(&self, alert_id: i64, account: &str, at: DateTime<Utc>, message: &str, delivered: bool, error: Option<&str>) -> sqlx::Result<i64> {
+        sqlx::query_scalar(
+            "INSERT INTO alert_events (alert_id, account_id, fired_at, message, delivered, error) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id",
+        )
+        .bind(alert_id)
+        .bind(account)
+        .bind(at)
+        .bind(message)
+        .bind(delivered)
+        .bind(error)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    pub async fn set_event_delivered(&self, event_id: i64, delivered: bool, error: Option<&str>) -> sqlx::Result<()> {
+        sqlx::query("UPDATE alert_events SET delivered = $2, error = $3 WHERE id = $1")
+            .bind(event_id)
+            .bind(delivered)
+            .bind(error)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn alert_session(&self, account: &str) -> sqlx::Result<Option<String>> {
+        sqlx::query_scalar("SELECT alert_session_id FROM accounts WHERE id = $1").bind(account).fetch_one(&self.pool).await
+    }
+
+    pub async fn set_alert_session(&self, account: &str, session: &str) -> sqlx::Result<()> {
+        sqlx::query("UPDATE accounts SET alert_session_id = $2 WHERE id = $1").bind(account).bind(session).execute(&self.pool).await?;
+        Ok(())
     }
 
     pub async fn cash_balances(&self, account: &str, generation: i32) -> sqlx::Result<HashMap<Currency, Decimal>> {

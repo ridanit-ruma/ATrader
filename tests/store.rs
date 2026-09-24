@@ -254,3 +254,46 @@ async fn daily_snapshots_can_be_read_alone(pool: PgPool) {
     assert_eq!(store.snapshots("a", 1, None, true).await.unwrap().len(), 1);
     assert_eq!(store.snapshots("a", 1, None, false).await.unwrap().len(), 3);
 }
+
+#[sqlx::test]
+async fn alerts_round_trip_per_account_and_generation(pool: PgPool) {
+    use atrader::alerts::{Alert, Condition};
+    let store = Store::new(pool);
+    store.create_account("a", "A", Some("ag"), &[(Currency::Krw, dec!(1))], Utc::now()).await.unwrap();
+    store.create_account("b", "B", Some("ag"), &[(Currency::Krw, dec!(1))], Utc::now()).await.unwrap();
+    let btc: InstrumentId = "UPBIT:KRW-BTC".parse().unwrap();
+    let alert = |account: &str, condition| Alert {
+        id: 0,
+        account: account.into(),
+        generation: 1,
+        condition,
+        note: "watch".into(),
+        once: true,
+        created_at: Utc::now(),
+        last_fired_at: None,
+    };
+    let id = store.create_alert(&alert("a", Condition::PriceAbove { id: btc.clone(), price: dec!(100) })).await.unwrap();
+    store.create_alert(&alert("a", Condition::Move { id: btc.clone(), pct: dec!(3), window_minutes: 30 })).await.unwrap();
+    store.create_alert(&alert("a", Condition::SessionOpen { venue: Venue::Krx })).await.unwrap();
+    store.create_alert(&alert("b", Condition::OrderFilled { id: None })).await.unwrap();
+    let a = store.active_alerts("a", 1).await.unwrap();
+    assert_eq!(a.len(), 3);
+    assert_eq!(a[0].condition, Condition::PriceAbove { id: btc.clone(), price: dec!(100) });
+    assert_eq!(a[1].condition, Condition::Move { id: btc.clone(), pct: dec!(3), window_minutes: 30 });
+    assert_eq!(a[2].condition, Condition::SessionOpen { venue: Venue::Krx });
+
+    assert!(!store.deactivate_alert("b", id).await.unwrap()); // not b's
+    assert!(store.deactivate_alert("a", id).await.unwrap());
+    assert!(!store.deactivate_alert("a", id).await.unwrap()); // already off
+    assert_eq!(store.active_alerts("a", 1).await.unwrap().len(), 2);
+
+    store.reset_account("a", &[(Currency::Krw, dec!(1))], Utc::now()).await.unwrap();
+    let gens = std::collections::HashMap::from([("a".to_string(), 2), ("b".to_string(), 1)]);
+    assert_eq!(store.all_active_alerts(&gens).await.unwrap().len(), 1); // a's gen-1 alerts are gone
+
+    let ev = store.record_alert_event(id, "a", Utc::now(), "fired", false, Some("offline")).await.unwrap();
+    store.set_event_delivered(ev, true, None).await.unwrap();
+    assert_eq!(store.alert_session("a").await.unwrap(), None);
+    store.set_alert_session("a", "sess-1").await.unwrap();
+    assert_eq!(store.alert_session("a").await.unwrap().as_deref(), Some("sess-1"));
+}
