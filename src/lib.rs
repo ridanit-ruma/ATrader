@@ -6,9 +6,11 @@ pub mod sim;
 pub mod ledger;
 pub mod market;
 pub mod persist;
+pub mod app;
 pub mod broker;
 pub mod store;
 pub mod subs;
+pub mod tools;
 pub mod stats;
 
 /// Install `ring` as rustls' process-wide crypto provider (reqwest is built without one).

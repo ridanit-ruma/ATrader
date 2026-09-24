@@ -23,16 +23,28 @@ pub fn parse_frankfurter(bytes: &[u8]) -> anyhow::Result<Decimal> {
 pub struct FxCache {
     http: reqwest::Client,
     cached: Mutex<Option<(Decimal, Instant)>>,
+    fixed: bool,
 }
 
 impl FxCache {
     pub fn new() -> Self {
         crate::init_tls();
-        FxCache { http: reqwest::Client::new(), cached: Mutex::new(None) }
+        FxCache { http: reqwest::Client::new(), cached: Mutex::new(None), fixed: false }
+    }
+
+    /// A cache that always answers `rate` (tests, and offline runs).
+    pub fn fixed(rate: Decimal) -> Self {
+        crate::init_tls();
+        FxCache { http: reqwest::Client::new(), cached: Mutex::new(Some((rate, Instant::now()))), fixed: true }
     }
 
     /// KRW per USD. Refreshes after an hour; if the refresh fails, the last good rate is used.
     pub async fn usd_krw(&self) -> anyhow::Result<Decimal> {
+        if self.fixed {
+            if let Some((rate, _)) = *self.cached.lock().unwrap() {
+                return Ok(rate);
+            }
+        }
         let cached = *self.cached.lock().unwrap();
         if let Some((rate, at)) = cached {
             if at.elapsed() < MAX_AGE {
