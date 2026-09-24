@@ -336,3 +336,41 @@ fn closed_market_books_do_not_fill_day_orders() {
     assert!(b.on_trade(trade(&clock, samsung(), dec!(69800), dec!(100))).is_empty());
     assert_eq!(b.order(order.id).unwrap().status, OrderStatus::Open);
 }
+
+#[test]
+fn book_age_and_active_instruments() {
+    let (b, clock) = setup();
+    clock.advance(Duration::seconds(3));
+    assert_eq!(b.book_age(&btc()), Some(Duration::seconds(3)));
+    assert_eq!(b.book_age(&"UPBIT:KRW-XRP".parse().unwrap()), None);
+    clock.set(Utc.with_ymd_and_hms(2026, 9, 23, 1, 0, 0).unwrap());
+    b.place_sync("a", market_buy(dec!(0.1))).unwrap();
+    b.place_sync("a", limit(samsung(), Side::Buy, dec!(1), dec!(69900), Tif::Day)).unwrap();
+    assert_eq!(b.active_instruments(), vec![samsung(), btc()]);
+    assert!(!b.has_stats(&btc()));
+    b.set_stats(btc(), atrader::sim::DailyStats { sigma: 0.02, adv_notional: dec!(1) });
+    assert!(b.has_stats(&btc()));
+}
+
+#[test]
+fn convert_moves_cash_at_rate_minus_spread() {
+    let (b, _) = setup();
+    let c = b.convert_sync("a", Currency::Krw, Currency::Usd, dec!(1365350), dec!(1365.35), dec!(0.001)).unwrap();
+    assert_eq!((c.debit, c.credit), (dec!(1365350), dec!(999)));
+    let pf = b.portfolio("a").unwrap();
+    assert_eq!(pf.cash(Currency::Krw), dec!(1000000000) - dec!(1365350));
+    assert_eq!(pf.cash(Currency::Usd), dec!(999));
+    let back = b.convert_sync("a", Currency::Usd, Currency::Krw, dec!(100), dec!(1365.35), dec!(0.001)).unwrap();
+    assert_eq!(back.credit, dec!(136398)); // 136,398.465 truncated
+}
+
+#[test]
+fn bad_conversions_change_nothing() {
+    let (b, _) = setup();
+    let before = b.portfolio("a").unwrap();
+    assert!(matches!(b.convert_sync("a", Currency::Krw, Currency::Krw, dec!(1), dec!(1365), dec!(0)), Err(OrderError::InvalidRequest(_))));
+    assert!(matches!(b.convert_sync("a", Currency::Krw, Currency::Usd, dec!(0), dec!(1365), dec!(0)), Err(OrderError::InvalidRequest(_))));
+    assert!(matches!(b.convert_sync("a", Currency::Usd, Currency::Krw, dec!(1), dec!(1365), dec!(0)), Err(OrderError::InsufficientFunds { .. })));
+    assert_eq!(b.convert_sync("nobody", Currency::Krw, Currency::Usd, dec!(1), dec!(1365), dec!(0)), Err(OrderError::UnknownAccount));
+    assert_eq!(b.portfolio("a").unwrap(), before);
+}

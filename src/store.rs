@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
-use crate::broker::{Fill, Order};
+use crate::broker::{Conversion, Fill, Order};
 use crate::domain::{Currency, InstrumentId, Side};
 use crate::ledger::Portfolio;
 use crate::sim::Size;
@@ -181,19 +181,38 @@ impl Store {
         Ok(fill_id)
     }
 
+    /// Record a currency conversion as two `fx` ledger entries.
+    pub async fn save_conversion(&self, account: &str, generation: i32, c: &Conversion, at: DateTime<Utc>) -> sqlx::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for (currency, amount) in [(c.from, -c.debit), (c.to, c.credit)] {
+            sqlx::query(
+                "INSERT INTO ledger_entries (account_id, generation, currency, amount, kind, at)
+                 VALUES ($1, $2, $3, $4, 'fx', $5)",
+            )
+            .bind(account)
+            .bind(generation)
+            .bind(currency.code())
+            .bind(amount)
+            .bind(at)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await
+    }
+
     pub async fn cash_balances(&self, account: &str, generation: i32) -> sqlx::Result<HashMap<Currency, Decimal>> {
         self.sum_by_currency(account, generation, false).await
     }
 
-    async fn sum_by_currency(&self, account: &str, generation: i32, deposits_only: bool) -> sqlx::Result<HashMap<Currency, Decimal>> {
+    async fn sum_by_currency(&self, account: &str, generation: i32, non_trade_only: bool) -> sqlx::Result<HashMap<Currency, Decimal>> {
         let rows = sqlx::query(
             "SELECT currency, SUM(amount) AS total FROM ledger_entries
-             WHERE account_id = $1 AND generation = $2 AND (NOT $3 OR kind = 'deposit')
+             WHERE account_id = $1 AND generation = $2 AND (NOT $3 OR kind IN ('deposit', 'fx'))
              GROUP BY currency",
         )
         .bind(account)
         .bind(generation)
-        .bind(deposits_only)
+        .bind(non_trade_only)
         .fetch_all(&self.pool)
         .await?;
         rows.iter()

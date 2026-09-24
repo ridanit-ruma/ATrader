@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, RoundingStrategy};
 use rust_decimal_macros::dec;
 
 use crate::domain::{Book, Clock, Currency, InstrumentId, Level, Side, Trade, Venue};
@@ -106,6 +106,17 @@ pub struct Estimate {
     pub slippage_bps: Decimal,
     /// Permanent price shift this execution would leave behind.
     pub impact_bps: f64,
+}
+
+/// One cash conversion between currencies.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Conversion {
+    pub from: Currency,
+    pub to: Currency,
+    pub debit: Decimal,
+    pub credit: Decimal,
+    /// Units of `to` per unit of `from`, after the spread.
+    pub rate: Decimal,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -449,6 +460,60 @@ impl SimBroker {
             .map(|o| o.id)
             .collect();
         ids.into_iter().map(|id| close_order(w, id, OrderStatus::Expired)).collect()
+    }
+
+    /// How old the instrument's latest book is, if there is one.
+    pub fn book_age(&self, id: &InstrumentId) -> Option<Duration> {
+        let now = self.clock.now();
+        self.world.lock().unwrap().books.get(id).map(|b| now - b.received_at)
+    }
+
+    /// Instruments with a position or a resting order in any account, sorted.
+    pub fn active_instruments(&self) -> Vec<InstrumentId> {
+        let w = self.world.lock().unwrap();
+        let mut ids: Vec<InstrumentId> = w
+            .accounts
+            .values()
+            .flat_map(|p| p.positions.keys().cloned())
+            .chain(w.resting.iter().filter(|(_, r)| !r.is_empty()).map(|(id, _)| id.clone()))
+            .collect();
+        ids.sort_by_key(|i| i.to_string());
+        ids.dedup();
+        ids
+    }
+
+    pub fn has_stats(&self, id: &InstrumentId) -> bool {
+        self.world.lock().unwrap().stats.contains_key(id)
+    }
+
+    /// Move cash between currencies at `usd_krw` KRW per USD (USDT counts as USD), less `spread`.
+    /// The credit is truncated to the target currency's minor unit.
+    pub fn convert_sync(
+        &self,
+        account: &str,
+        from: Currency,
+        to: Currency,
+        amount: Decimal,
+        usd_krw: Decimal,
+        spread: Decimal,
+    ) -> Result<Conversion, OrderError> {
+        if from == to || amount <= Decimal::ZERO || amount > MAX_INPUT || usd_krw <= Decimal::ZERO {
+            return Err(OrderError::InvalidRequest(
+                "convert needs two different currencies, a positive amount and a positive rate".into(),
+            ));
+        }
+        let mut w = self.world.lock().unwrap();
+        let pf = w.accounts.get_mut(account).ok_or(OrderError::UnknownAccount)?;
+        let available = pf.available_cash(from);
+        if amount > available {
+            return Err(OrderError::InsufficientFunds { required: amount, available });
+        }
+        let krw_per = |c: Currency| if c == Currency::Krw { Decimal::ONE } else { usd_krw };
+        let net = Decimal::ONE - spread;
+        let credit = (amount * krw_per(from) * net / krw_per(to)).round_dp_with_strategy(to.decimals(), RoundingStrategy::ToZero);
+        *pf.cash.entry(from).or_default() -= amount;
+        *pf.cash.entry(to).or_default() += credit;
+        Ok(Conversion { from, to, debit: amount, credit, rate: (krw_per(from) * net / krw_per(to)).round_dp(8) })
     }
 
     pub fn estimate(&self, account: &str, req: &OrderRequest) -> Result<Estimate, OrderError> {

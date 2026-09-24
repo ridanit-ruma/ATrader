@@ -92,3 +92,15 @@ async fn reset_starts_a_new_generation(pool: PgPool) {
     assert!(pf.positions.is_empty());
     assert_eq!(store.cash_balances("a", 1).await.unwrap()[&Currency::Krw], dec!(299895)); // history kept
 }
+
+#[sqlx::test]
+async fn conversions_survive_replay(pool: PgPool) {
+    let store = Store::new(pool);
+    store.create_account("a", "Test", None, &[(Currency::Krw, dec!(2000000))], Utc::now()).await.unwrap();
+    let c = Conversion { from: Currency::Krw, to: Currency::Usd, debit: dec!(1365350), credit: dec!(999), rate: dec!(0.00073167) };
+    store.save_conversion("a", 1, &c, Utc::now()).await.unwrap();
+    let cash = store.cash_balances("a", 1).await.unwrap();
+    assert_eq!((cash[&Currency::Krw], cash[&Currency::Usd]), (dec!(634650), dec!(999)));
+    let pf = store.load_portfolio("a", 1).await.unwrap();
+    assert_eq!((pf.cash(Currency::Krw), pf.cash(Currency::Usd)), (dec!(634650), dec!(999)));
+}

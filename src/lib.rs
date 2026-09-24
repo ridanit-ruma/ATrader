@@ -1,5 +1,6 @@
 pub mod domain;
 pub mod feed;
+pub mod fx;
 pub mod venue;
 pub mod sim;
 pub mod ledger;
