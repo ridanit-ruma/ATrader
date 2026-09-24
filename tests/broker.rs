@@ -386,3 +386,78 @@ fn conversions_that_lose_money_are_rejected() {
     assert!(matches!(r(Currency::Krw, Currency::Usd, dec!(1365350), dec!(1)), Err(OrderError::InvalidRequest(_))));
     assert_eq!(b.portfolio("a").unwrap(), before);
 }
+
+fn journaled() -> (SimBroker, ManualClock, tokio::sync::mpsc::UnboundedReceiver<Journal>) {
+    let (b, clock) = setup();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    (b.with_journal(tx), clock, rx)
+}
+
+fn drain(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Journal>) -> Vec<Journal> {
+    std::iter::from_fn(|| rx.try_recv().ok()).collect()
+}
+
+#[test]
+fn journal_records_every_change_in_order() {
+    let (b, clock, mut rx) = journaled();
+    let (order, fills) = b.place_sync("a", market_buy(dec!(0.1))).unwrap();
+    assert_eq!(drain(&mut rx), vec![Journal::Order(order.clone()), Journal::Fill(fills[0].clone())]);
+
+    let (resting, _) = b.place_sync("a", limit(btc(), Side::Buy, dec!(0.1), dec!(99998000), Tif::Gtc)).unwrap();
+    drain(&mut rx);
+    // Well below the limit even after the market buy's impact shifted prints upward.
+    let f = b.on_trade(trade(&clock, btc(), dec!(99000000), dec!(1)));
+    let j = drain(&mut rx);
+    assert!(matches!(&j[0], Journal::Order(o) if o.id == resting.id && o.status == OrderStatus::Filled));
+    assert_eq!(j[1], Journal::Fill(f[0].clone()));
+
+    let (open, _) = b.place_sync("a", limit(btc(), Side::Buy, dec!(0.1), dec!(99998000), Tif::Gtc)).unwrap();
+    drain(&mut rx);
+    b.cancel_sync("a", open.id).unwrap();
+    assert!(matches!(&drain(&mut rx)[..], [Journal::Order(o)] if o.status == OrderStatus::Cancelled));
+
+    let c = b.convert_sync("a", Currency::Krw, Currency::Usd, dec!(1365350), dec!(1365.35), dec!(0.001)).unwrap();
+    assert!(matches!(&drain(&mut rx)[..], [Journal::Conversion { account, conversion, .. }] if account == "a" && *conversion == c));
+}
+
+#[test]
+fn book_view_shows_shadow_real_and_last_trade() {
+    let (b, clock) = setup();
+    b.on_trade(trade(&clock, btc(), dec!(100000000), dec!(0.01)));
+    b.place_sync("a", market_buy(dec!(0.5))).unwrap();
+    let v = b.book_view(&btc(), 5).unwrap();
+    assert_eq!(v.real_asks[0].price, dec!(100000000));
+    assert!(v.shadow_asks[0].price > dec!(100000000)); // first level used up, the rest pushed up
+    assert!(v.offset > 0.0);
+    assert_eq!(v.last_trade.map(|t| t.0), Some(dec!(100000000)));
+    assert!(b.book_view(&"UPBIT:KRW-XRP".parse().unwrap(), 5).is_none());
+}
+
+#[test]
+fn search_matches_symbol_or_name() {
+    let (b, _) = setup();
+    assert_eq!(b.search("btc", None, 10)[0].id, btc());
+    assert_eq!(b.search("samsung", None, 10)[0].id, samsung());
+    assert_eq!(b.search("005930", Some(Venue::Krx), 10).len(), 1);
+    assert!(b.search("005930", Some(Venue::Upbit), 10).is_empty());
+    assert_eq!(b.search("", None, 10).len(), 0);
+}
+
+#[test]
+fn restored_orders_reserve_and_fill_again() {
+    let (b, clock) = setup();
+    let (order, _) = b.place_sync("a", limit(btc(), Side::Buy, dec!(0.1), dec!(99998000), Tif::Gtc)).unwrap();
+    let pf = b.portfolio("a").unwrap();
+
+    let (fresh, _) = setup();
+    let mut unreserved = pf.clone();
+    unreserved.reserved_cash.clear();
+    fresh.restore_account("a", unreserved);
+    fresh.restore_order(order.clone()).unwrap();
+    assert_eq!(fresh.portfolio("a").unwrap().available_cash(Currency::Krw), pf.available_cash(Currency::Krw));
+    let f = fresh.on_trade(trade(&clock, btc(), dec!(99990000), dec!(1)));
+    assert_eq!(f[0].order_id, order.id);
+    fresh.set_next_order_id(1); // never moves backwards
+    let (next, _) = fresh.place_sync("a", market_buy(dec!(0.1))).unwrap();
+    assert!(next.id > order.id);
+}

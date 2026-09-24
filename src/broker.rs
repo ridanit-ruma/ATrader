@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use tokio::sync::mpsc;
 use chrono::{DateTime, Duration, Utc};
 use rust_decimal::{Decimal, RoundingStrategy};
 use rust_decimal_macros::dec;
@@ -119,6 +120,27 @@ pub struct Conversion {
     pub rate: Decimal,
 }
 
+/// Every change the broker makes that must be persisted, in the order it happened.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Journal {
+    Order(Order),
+    Fill(Fill),
+    Conversion { account: AccountId, conversion: Conversion, at: DateTime<Utc> },
+}
+
+/// The shadow book next to the real one, for quotes and order-book tools.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BookView {
+    pub instrument: InstrumentId,
+    pub shadow_bids: Vec<Level>,
+    pub shadow_asks: Vec<Level>,
+    pub real_bids: Vec<Level>,
+    pub real_asks: Vec<Level>,
+    pub offset: f64,
+    pub received_at: DateTime<Utc>,
+    pub last_trade: Option<(Decimal, DateTime<Utc>)>,
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum OrderError {
     #[error("unknown account")]
@@ -166,6 +188,7 @@ struct World {
     accounts: HashMap<AccountId, Portfolio>,
     orders: HashMap<OrderId, Order>,
     resting: HashMap<InstrumentId, Vec<Resting>>,
+    last_trades: HashMap<InstrumentId, (Decimal, DateTime<Utc>)>,
     next_order_id: OrderId,
 }
 
@@ -175,6 +198,7 @@ pub struct SimBroker {
     staleness: Duration,
     // ponytail: one global lock over the simulated world; per-instrument actors (spec §13) if order rate needs it.
     world: Mutex<World>,
+    journal: Option<mpsc::UnboundedSender<Journal>>,
 }
 
 /// The result of validating an order against the current shadow book.
@@ -281,34 +305,49 @@ fn release(w: &mut World, order: &Order, qty: Decimal) {
     }
 }
 
-/// Take a resting order off the book with `status`, returning its reservation.
-fn close_order(w: &mut World, order_id: OrderId, status: OrderStatus) -> Order {
-    let mut order = w.orders.remove(&order_id).expect("tracked order");
-    let mut remaining = Decimal::ZERO;
-    if let Some(rest) = w.resting.get_mut(&order.req.instrument) {
-        if let Some(pos) = rest.iter().position(|r| r.order_id == order_id) {
-            remaining = rest.remove(pos).remaining;
+impl SimBroker {
+    /// Send every persisted-state change to `tx` (see `Journal`).
+    pub fn with_journal(mut self, tx: mpsc::UnboundedSender<Journal>) -> Self {
+        self.journal = Some(tx);
+        self
+    }
+
+    fn emit(&self, j: Journal) {
+        if let Some(tx) = &self.journal {
+            let _ = tx.send(j);
         }
     }
-    release(w, &order, remaining);
-    order.status = status;
-    w.orders.insert(order_id, order.clone());
-    order
-}
 
-impl SimBroker {
+    /// Take a resting order off the book with `status`, returning its reservation.
+    fn close_order(&self, w: &mut World, order_id: OrderId, status: OrderStatus) -> Order {
+        let mut order = w.orders.remove(&order_id).expect("tracked order");
+        let mut remaining = Decimal::ZERO;
+        if let Some(rest) = w.resting.get_mut(&order.req.instrument) {
+            if let Some(pos) = rest.iter().position(|r| r.order_id == order_id) {
+                remaining = rest.remove(pos).remaining;
+            }
+        }
+        release(w, &order, remaining);
+        order.status = status;
+        w.orders.insert(order_id, order.clone());
+        self.emit(Journal::Order(order.clone()));
+        order
+    }
+
     pub fn new(clock: Arc<dyn Clock>, calendar: Calendar) -> Self {
         SimBroker {
             clock,
             calendar,
             staleness: Duration::seconds(5),
             world: Mutex::new(World { next_order_id: 1, ..Default::default() }),
+            journal: None,
         }
     }
 
     /// Continue order numbering after the highest id already persisted.
     pub fn set_next_order_id(&self, id: OrderId) {
-        self.world.lock().unwrap().next_order_id = id;
+        let mut w = self.world.lock().unwrap();
+        w.next_order_id = w.next_order_id.max(id);
     }
 
     /// Instruments with a non-positive tick or lot step are refused (they would divide by zero).
@@ -383,10 +422,13 @@ impl SimBroker {
             shadow_consume(w, &id, r.side, &slices);
             let mut order = w.orders.remove(&r.order_id).expect("resting order is tracked");
             release(w, &order, qty);
-            fills.push(record_fill(w, &mut order, qty, qty * r.price, Liquidity::Maker, now));
+            let fill = record_fill(w, &mut order, qty, qty * r.price, Liquidity::Maker, now);
             if r.remaining.is_zero() {
                 order.status = OrderStatus::Filled;
             }
+            self.emit(Journal::Order(order.clone()));
+            self.emit(Journal::Fill(fill.clone()));
+            fills.push(fill);
             w.orders.insert(r.order_id, order);
         }
         rest.retain(|r| r.remaining > Decimal::ZERO);
@@ -403,7 +445,11 @@ impl SimBroker {
         let mut guard = self.world.lock().unwrap();
         let w = &mut *guard;
         let id = trade.instrument.clone();
-        if trade.price <= Decimal::ZERO || trade.qty <= Decimal::ZERO || !self.calendar.is_open(id.venue, now) {
+        if trade.price <= Decimal::ZERO || trade.qty <= Decimal::ZERO {
+            return Vec::new();
+        }
+        w.last_trades.insert(id.clone(), (trade.price, trade.at));
+        if !self.calendar.is_open(id.venue, now) {
             return Vec::new();
         }
         let Some(tick) = w.instruments.get(&id).map(|i| i.tick.clone()) else { return Vec::new() };
@@ -424,10 +470,13 @@ impl SimBroker {
             }
             let mut order = w.orders.remove(&r.order_id).expect("resting order is tracked");
             release(w, &order, q);
-            fills.push(record_fill(w, &mut order, q, q * r.price, Liquidity::Maker, now));
+            let fill = record_fill(w, &mut order, q, q * r.price, Liquidity::Maker, now);
             if r.remaining.is_zero() {
                 order.status = OrderStatus::Filled;
             }
+            self.emit(Journal::Order(order.clone()));
+            self.emit(Journal::Fill(fill.clone()));
+            fills.push(fill);
             w.orders.insert(r.order_id, order);
         }
         rest.retain(|r| r.remaining > Decimal::ZERO);
@@ -444,7 +493,7 @@ impl SimBroker {
         if order.status != OrderStatus::Open {
             return Ok(order.clone());
         }
-        Ok(close_order(w, order_id, OrderStatus::Cancelled))
+        Ok(self.close_order(w, order_id, OrderStatus::Cancelled))
     }
 
     /// Expire open DAY orders whose venue is closed. Call on a timer.
@@ -459,7 +508,7 @@ impl SimBroker {
             .filter(|o| !self.calendar.is_open(o.req.instrument.venue, now))
             .map(|o| o.id)
             .collect();
-        ids.into_iter().map(|id| close_order(w, id, OrderStatus::Expired)).collect()
+        ids.into_iter().map(|id| self.close_order(w, id, OrderStatus::Expired)).collect()
     }
 
     /// How old the instrument's latest book is, if there is one.
@@ -525,7 +574,94 @@ impl SimBroker {
         }
         *pf.cash.entry(from).or_default() -= amount;
         *pf.cash.entry(to).or_default() += credit;
-        Ok(Conversion { from, to, debit: amount, credit, rate: (krw_per(from) * net / krw_per(to)).round_dp(8) })
+        let c = Conversion { from, to, debit: amount, credit, rate: (krw_per(from) * net / krw_per(to)).round_dp(8) };
+        self.emit(Journal::Conversion { account: account.to_string(), conversion: c.clone(), at: self.clock.now() });
+        Ok(c)
+    }
+
+    pub fn now(&self) -> DateTime<Utc> {
+        self.clock.now()
+    }
+
+    pub fn instrument(&self, id: &InstrumentId) -> Option<Instrument> {
+        self.world.lock().unwrap().instruments.get(id).cloned()
+    }
+
+    /// Whether `venue` is open now, and when it next opens (`None` for 24/7 venues).
+    pub fn market_open(&self, venue: Venue) -> (bool, Option<DateTime<Utc>>) {
+        let now = self.clock.now();
+        (self.calendar.is_open(venue, now), self.calendar.next_open(venue, now))
+    }
+
+    /// Instruments whose symbol or name contains `query` (case-insensitive); exact symbols first.
+    pub fn search(&self, query: &str, venue: Option<Venue>, limit: usize) -> Vec<Instrument> {
+        let q = query.trim().to_lowercase();
+        if q.is_empty() {
+            return Vec::new();
+        }
+        let w = self.world.lock().unwrap();
+        let mut hits: Vec<&Instrument> = w
+            .instruments
+            .values()
+            .filter(|i| venue.is_none_or(|v| i.id.venue == v))
+            .filter(|i| i.id.symbol.to_lowercase().contains(&q) || i.name.to_lowercase().contains(&q))
+            .collect();
+        hits.sort_by_key(|i| (!i.id.symbol.to_lowercase().ends_with(&q), i.id.symbol.len(), i.id.to_string()));
+        hits.into_iter().take(limit).cloned().collect()
+    }
+
+    /// The shadow and real books to `depth` levels, decayed to now.
+    pub fn book_view(&self, id: &InstrumentId, depth: usize) -> Option<BookView> {
+        let now = self.clock.now();
+        let mut guard = self.world.lock().unwrap();
+        let w = &mut *guard;
+        let book = w.books.get(id)?;
+        let inst = w.instruments.get(id)?;
+        let shadow = w.shadows.entry(id.clone()).or_default();
+        shadow.decay(now, &SimParams::default_for(id.venue));
+        let levels = |v: Vec<sim::ShadowLevel>| v.into_iter().take(depth).map(|l| Level { price: l.price, qty: l.qty }).collect();
+        Some(BookView {
+            instrument: id.clone(),
+            shadow_bids: levels(shadow.shadow_side(&book.bids, Side::Buy, &inst.tick)),
+            shadow_asks: levels(shadow.shadow_side(&book.asks, Side::Sell, &inst.tick)),
+            real_bids: book.bids.iter().take(depth).copied().collect(),
+            real_asks: book.asks.iter().take(depth).copied().collect(),
+            offset: shadow.offset,
+            received_at: book.received_at,
+            last_trade: w.last_trades.get(id).copied(),
+        })
+    }
+
+    /// Replace an account's portfolio with one rebuilt from the store.
+    pub fn restore_account(&self, id: &str, portfolio: Portfolio) {
+        self.world.lock().unwrap().accounts.insert(id.to_string(), portfolio);
+    }
+
+    /// Put a persisted open limit order back on the book, reserving what it still needs. Its
+    /// queue position restarts at zero.
+    pub fn restore_order(&self, order: Order) -> Result<(), OrderError> {
+        let (Size::Qty(qty), Some(price), OrderStatus::Open) = (order.req.size, order.req.limit_price, order.status) else {
+            return Err(OrderError::InvalidRequest(format!("order {} is not an open limit order", order.id)));
+        };
+        let remaining = qty - order.filled_qty;
+        let mut guard = self.world.lock().unwrap();
+        let w = &mut *guard;
+        let venue = order.req.instrument.venue;
+        let pf = w.accounts.get_mut(&order.account).ok_or(OrderError::UnknownAccount)?;
+        match order.req.side {
+            Side::Buy => pf.reserve_cash(venue.currency(), buy_reserve_per_unit(price, venue) * remaining),
+            Side::Sell => pf.reserve_qty(&order.req.instrument, remaining),
+        }
+        w.resting.entry(order.req.instrument.clone()).or_default().push(Resting {
+            order_id: order.id,
+            side: order.req.side,
+            price,
+            remaining,
+            queue_ahead: Decimal::ZERO,
+        });
+        w.next_order_id = w.next_order_id.max(order.id + 1);
+        w.orders.insert(order.id, order);
+        Ok(())
     }
 
     pub fn estimate(&self, account: &str, req: &OrderRequest) -> Result<Estimate, OrderError> {
@@ -588,6 +724,10 @@ impl SimBroker {
             order.status = if is_complete(&order) { OrderStatus::Filled } else { OrderStatus::Cancelled };
         }
         w.orders.insert(id, order.clone());
+        self.emit(Journal::Order(order.clone()));
+        for f in &fills {
+            self.emit(Journal::Fill(f.clone()));
+        }
         Ok((order, fills))
     }
 
