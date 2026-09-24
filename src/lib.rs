@@ -28,3 +28,4 @@ pub mod indicators;
 pub mod performance;
 pub mod fundamentals;
 pub mod alerts;
+pub mod web;

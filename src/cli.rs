@@ -27,6 +27,8 @@ USAGE:
   atrader account create <id> <name> [--agent <attacca-agent-id>] [--cash KRW=10000000]...
   atrader account list
   atrader account reset <id> [--cash KRW=10000000]...
+  atrader user create <username>
+  atrader user reset-2fa <username>
 
 ENVIRONMENT:
   DATABASE_URL          Postgres connection string (required)
@@ -47,6 +49,8 @@ pub enum Command {
     AccountCreate { id: String, name: String, agent: Option<String>, cash: Vec<(Currency, Decimal)> },
     AccountList,
     AccountReset { id: String, cash: Vec<(Currency, Decimal)> },
+    UserCreate { username: String },
+    UserReset2fa { username: String },
     Version,
     Help,
 }
@@ -92,6 +96,8 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             let (agent, cash) = parse_flags(&args[4..])?;
             Ok(Command::AccountCreate { id: id.to_string(), name: name.to_string(), agent, cash })
         }
+        ["user", "create", name] => Ok(Command::UserCreate { username: name.to_string() }),
+        ["user", "reset-2fa", name] => Ok(Command::UserReset2fa { username: name.to_string() }),
         ["account", "reset", id, ..] => {
             let (agent, cash) = parse_flags(&args[3..])?;
             if agent.is_some() {
@@ -143,6 +149,24 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
                         cash.join(" ")
                     );
                 }
+            }
+            Command::UserCreate { username } => {
+                let pw = rpassword::prompt_password("password (12+ characters): ")?;
+                if pw.chars().count() < 12 {
+                    anyhow::bail!("the password must be at least 12 characters");
+                }
+                if rpassword::prompt_password("again: ")? != pw {
+                    anyhow::bail!("the passwords differ");
+                }
+                crate::web::auth::AuthStore(store.pool().clone()).create_user(&username, &crate::web::auth::hash_password(&pw)).await?;
+                println!("created user {username}; log in to the dashboard to enrol two-factor authentication");
+            }
+            Command::UserReset2fa { username } => {
+                let auth = crate::web::auth::AuthStore(store.pool().clone());
+                let user = auth.user_by_name(&username).await?.ok_or_else(|| anyhow!("no user {username}"))?;
+                auth.set_totp(user.id, None, false).await?;
+                auth.save_recovery_codes(user.id, &[]).await?;
+                println!("two-factor authentication cleared for {username}; it is enrolled again at the next login");
             }
             Command::AccountReset { id, cash } => {
                 // A running server keeps trading the old generation in memory; stop it first.
@@ -312,6 +336,13 @@ mod tests {
         );
         assert_eq!(parse(&args(&[])), Ok(Command::Help));
         assert_eq!(parse(&args(&["--version"])), Ok(Command::Version));
+    }
+
+    #[test]
+    fn parses_user_commands() {
+        assert_eq!(parse(&args(&["user", "create", "ruma"])), Ok(Command::UserCreate { username: "ruma".into() }));
+        assert_eq!(parse(&args(&["user", "reset-2fa", "ruma"])), Ok(Command::UserReset2fa { username: "ruma".into() }));
+        assert!(parse(&args(&["user", "create"])).is_err());
     }
 
     #[test]
