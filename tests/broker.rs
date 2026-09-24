@@ -176,3 +176,90 @@ async fn works_through_the_broker_trait() {
     let (order, _) = broker.place("a", market_buy(dec!(0.1))).await.unwrap();
     assert_eq!(order.status, OrderStatus::Filled);
 }
+
+fn limit(id: InstrumentId, side: Side, qty: Decimal, price: Decimal, tif: Tif) -> OrderRequest {
+    req(id, side, OrderType::Limit, Size::Qty(qty), Some(price), tif)
+}
+
+fn trade(clock: &ManualClock, id: InstrumentId, price: Decimal, qty: Decimal) -> Trade {
+    Trade { instrument: id, price, qty, at: clock.now() }
+}
+
+#[test]
+fn resting_buy_reserves_cash_and_fills_on_trades() {
+    let (b, clock) = setup();
+    let (order, fills) = b.place_sync("a", limit(btc(), Side::Buy, dec!(0.1), dec!(99998000), Tif::Gtc)).unwrap();
+    assert_eq!((order.status, fills.len()), (OrderStatus::Open, 0));
+    let reserved = dec!(0.1) * dec!(99998000) * dec!(1.0005);
+    assert_eq!(b.portfolio("a").unwrap().available_cash(Currency::Krw), dec!(1000000000) - reserved);
+
+    let f = b.on_trade(trade(&clock, btc(), dec!(99998000), dec!(0.05)));
+    assert_eq!((f[0].qty, f[0].liquidity), (dec!(0.05), Liquidity::Maker));
+    let f = b.on_trade(trade(&clock, btc(), dec!(99990000), dec!(1))); // traded through
+    assert_eq!(f[0].qty, dec!(0.05));
+    assert_eq!(b.order(order.id).unwrap().status, OrderStatus::Filled);
+    let pf = b.portfolio("a").unwrap();
+    assert_eq!(pf.available_cash(Currency::Krw), pf.cash(Currency::Krw)); // nothing left reserved
+}
+
+#[test]
+fn queue_ahead_is_served_first() {
+    let (b, clock) = setup();
+    b.on_book(book(&clock, btc(), &[(dec!(99998000), dec!(0.3))], &[(dec!(100000000), dec!(0.5))]));
+    let (order, _) = b.place_sync("a", limit(btc(), Side::Buy, dec!(0.1), dec!(99998000), Tif::Gtc)).unwrap();
+    assert!(b.on_trade(trade(&clock, btc(), dec!(99998000), dec!(0.2))).is_empty());
+    let f = b.on_trade(trade(&clock, btc(), dec!(99998000), dec!(0.2)));
+    assert_eq!(f[0].qty, dec!(0.1));
+    assert_eq!(b.order(order.id).unwrap().status, OrderStatus::Filled);
+}
+
+#[test]
+fn book_crossing_a_resting_order_fills_it_as_taker() {
+    let (b, clock) = setup();
+    let (order, _) = b.place_sync("a", limit(btc(), Side::Buy, dec!(0.1), dec!(99998000), Tif::Gtc)).unwrap();
+    let f = b.on_book(book(&clock, btc(), &[(dec!(99990000), dec!(1))], &[(dec!(99997000), dec!(0.5))]));
+    assert_eq!((f[0].qty, f[0].price, f[0].liquidity), (dec!(0.1), dec!(99997000), Liquidity::Taker));
+    assert_eq!(b.order(order.id).unwrap().status, OrderStatus::Filled);
+}
+
+#[test]
+fn cancel_releases_the_reservation() {
+    let (b, _) = setup();
+    let (order, _) = b.place_sync("a", limit(btc(), Side::Buy, dec!(0.1), dec!(99998000), Tif::Gtc)).unwrap();
+    let cancelled = b.cancel_sync("a", order.id).unwrap();
+    assert_eq!(cancelled.status, OrderStatus::Cancelled);
+    assert_eq!(b.portfolio("a").unwrap().available_cash(Currency::Krw), dec!(1000000000));
+    assert_eq!(b.cancel_sync("someone-else", order.id), Err(OrderError::NotFound));
+}
+
+#[test]
+fn cannot_sell_shares_already_promised() {
+    let (b, _) = setup();
+    b.place_sync("a", market_buy(dec!(0.5))).unwrap();
+    b.place_sync("a", limit(btc(), Side::Sell, dec!(0.4), dec!(200000000), Tif::Gtc)).unwrap();
+    assert_eq!(
+        b.place_sync("a", limit(btc(), Side::Sell, dec!(0.2), dec!(200000000), Tif::Gtc)),
+        Err(OrderError::InsufficientPosition { available: dec!(0.1) })
+    );
+}
+
+#[test]
+fn day_orders_expire_after_the_close() {
+    let (b, clock) = setup();
+    let (order, _) = b.place_sync("a", limit(samsung(), Side::Buy, dec!(10), dec!(69900), Tif::Day)).unwrap();
+    assert_eq!(order.status, OrderStatus::Open);
+    assert!(b.expire_day_orders().is_empty());
+    clock.set(Utc.with_ymd_and_hms(2026, 9, 23, 6, 31, 0).unwrap()); // 15:31 KST
+    let expired = b.expire_day_orders();
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].status, OrderStatus::Expired);
+    assert_eq!(b.portfolio("a").unwrap().available_cash(Currency::Krw), dec!(1000000000));
+}
+
+#[tokio::test]
+async fn cancel_works_through_the_broker_trait() {
+    let (b, _) = setup();
+    let broker: Arc<dyn Broker> = Arc::new(b);
+    let (order, _) = broker.place("a", limit(btc(), Side::Buy, dec!(0.1), dec!(99998000), Tif::Gtc)).await.unwrap();
+    assert_eq!(broker.cancel("a", order.id).await.unwrap().status, OrderStatus::Cancelled);
+}

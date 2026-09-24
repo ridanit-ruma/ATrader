@@ -8,7 +8,7 @@ use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
-use crate::domain::{Book, Clock, Currency, InstrumentId, Side, Venue};
+use crate::domain::{Book, Clock, Currency, InstrumentId, Side, Trade, Venue};
 use crate::ledger::Portfolio;
 use crate::sim::{self, DailyStats, Resting, ShadowState, SimParams, Size, Slice};
 use crate::venue::{Calendar, FeeSchedule, Instrument, price_band};
@@ -257,6 +257,21 @@ fn release(w: &mut World, order: &Order, qty: Decimal) {
     }
 }
 
+/// Take a resting order off the book with `status`, returning its reservation.
+fn close_order(w: &mut World, order_id: OrderId, status: OrderStatus) -> Order {
+    let mut order = w.orders.remove(&order_id).expect("tracked order");
+    let mut remaining = Decimal::ZERO;
+    if let Some(rest) = w.resting.get_mut(&order.req.instrument) {
+        if let Some(pos) = rest.iter().position(|r| r.order_id == order_id) {
+            remaining = rest.remove(pos).remaining;
+        }
+    }
+    release(w, &order, remaining);
+    order.status = status;
+    w.orders.insert(order_id, order.clone());
+    order
+}
+
 impl SimBroker {
     pub fn new(clock: Arc<dyn Clock>, calendar: Calendar) -> Self {
         SimBroker {
@@ -301,11 +316,108 @@ impl SimBroker {
         shadow.offset
     }
 
-    /// A new real order book arrived.
+    /// A new real order book arrived. Resting orders it crosses fill as takers.
     pub fn on_book(&self, book: Book) -> Vec<Fill> {
-        let mut w = self.world.lock().unwrap();
-        w.books.insert(book.instrument.clone(), book);
-        Vec::new()
+        let now = self.clock.now();
+        let mut guard = self.world.lock().unwrap();
+        let w = &mut *guard;
+        let id = book.instrument.clone();
+        w.books.insert(id.clone(), book);
+        let Some(inst) = w.instruments.get(&id) else { return Vec::new() };
+        let (tick, step) = (inst.tick.clone(), inst.lot.step);
+        let params = SimParams::default_for(id.venue);
+        let mut rest = w.resting.remove(&id).unwrap_or_default();
+        let mut fills = Vec::new();
+        for r in rest.iter_mut() {
+            let book = &w.books[&id];
+            let shadow = w.shadows.entry(id.clone()).or_default();
+            shadow.decay(now, &params);
+            let levels = match r.side {
+                Side::Buy => shadow.shadow_side(&book.asks, Side::Sell, &tick),
+                Side::Sell => shadow.shadow_side(&book.bids, Side::Buy, &tick),
+            };
+            let slices = sim::walk(&levels, r.side, Size::Qty(r.remaining), r.price, step);
+            if slices.is_empty() {
+                continue;
+            }
+            let (qty, _) = sim::totals(&slices);
+            r.remaining -= qty;
+            let mut order = w.orders.remove(&r.order_id).expect("resting order is tracked");
+            release(w, &order, qty);
+            fills.push(take(w, &mut order, &slices, now));
+            if r.remaining.is_zero() {
+                order.status = OrderStatus::Filled;
+            }
+            w.orders.insert(r.order_id, order);
+        }
+        rest.retain(|r| r.remaining > Decimal::ZERO);
+        if !rest.is_empty() {
+            w.resting.insert(id, rest);
+        }
+        fills
+    }
+
+    /// A real trade printed. Resting orders at or through its (shifted) price fill as makers,
+    /// best price first, sharing the trade's size.
+    pub fn on_trade(&self, trade: Trade) -> Vec<Fill> {
+        let now = self.clock.now();
+        let mut guard = self.world.lock().unwrap();
+        let w = &mut *guard;
+        let id = trade.instrument.clone();
+        let Some(tick) = w.instruments.get(&id).map(|i| i.tick.clone()) else { return Vec::new() };
+        let shadow = w.shadows.entry(id.clone()).or_default();
+        shadow.decay(now, &SimParams::default_for(id.venue));
+        let price = shadow.shift(trade.price, &tick);
+
+        let mut rest = w.resting.remove(&id).unwrap_or_default();
+        // Buys highest first, then sells lowest first.
+        rest.sort_by_key(|r| (r.side == Side::Sell, if r.side == Side::Buy { -r.price } else { r.price }));
+        let (mut buy_avail, mut sell_avail) = (trade.qty, trade.qty);
+        let mut fills = Vec::new();
+        for r in rest.iter_mut() {
+            let avail = if r.side == Side::Buy { &mut buy_avail } else { &mut sell_avail };
+            let q = sim::passive_fill(r, price, avail);
+            if q.is_zero() {
+                continue;
+            }
+            let mut order = w.orders.remove(&r.order_id).expect("resting order is tracked");
+            release(w, &order, q);
+            fills.push(record_fill(w, &mut order, q, q * r.price, Liquidity::Maker, now));
+            if r.remaining.is_zero() {
+                order.status = OrderStatus::Filled;
+            }
+            w.orders.insert(r.order_id, order);
+        }
+        rest.retain(|r| r.remaining > Decimal::ZERO);
+        if !rest.is_empty() {
+            w.resting.insert(id, rest);
+        }
+        fills
+    }
+
+    pub fn cancel_sync(&self, account: &str, order_id: OrderId) -> Result<Order, OrderError> {
+        let mut guard = self.world.lock().unwrap();
+        let w = &mut *guard;
+        let order = w.orders.get(&order_id).filter(|o| o.account == account).ok_or(OrderError::NotFound)?;
+        if order.status != OrderStatus::Open {
+            return Ok(order.clone());
+        }
+        Ok(close_order(w, order_id, OrderStatus::Cancelled))
+    }
+
+    /// Expire open DAY orders whose venue is closed. Call on a timer.
+    pub fn expire_day_orders(&self) -> Vec<Order> {
+        let now = self.clock.now();
+        let mut guard = self.world.lock().unwrap();
+        let w = &mut *guard;
+        let ids: Vec<OrderId> = w
+            .orders
+            .values()
+            .filter(|o| o.status == OrderStatus::Open && o.req.tif == Tif::Day)
+            .filter(|o| !self.calendar.is_open(o.req.instrument.venue, now))
+            .map(|o| o.id)
+            .collect();
+        ids.into_iter().map(|id| close_order(w, id, OrderStatus::Expired)).collect()
     }
 
     pub fn estimate(&self, account: &str, req: &OrderRequest) -> Result<Estimate, OrderError> {
@@ -465,7 +577,7 @@ impl Broker for SimBroker {
         self.place_sync(account, req)
     }
 
-    async fn cancel(&self, _account: &str, _order_id: OrderId) -> Result<Order, OrderError> {
-        Err(OrderError::NotFound)
+    async fn cancel(&self, account: &str, order_id: OrderId) -> Result<Order, OrderError> {
+        self.cancel_sync(account, order_id)
     }
 }
