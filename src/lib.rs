@@ -26,3 +26,4 @@ pub mod candles;
 pub mod screen;
 pub mod indicators;
 pub mod performance;
+pub mod fundamentals;
