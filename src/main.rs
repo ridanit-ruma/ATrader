@@ -1,3 +1,7 @@
 fn main() {
-    println!("atrader {}", env!("CARGO_PKG_VERSION"));
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Err(e) = atrader::cli::run(args) {
+        eprintln!("error: {e:#}");
+        std::process::exit(1);
+    }
 }

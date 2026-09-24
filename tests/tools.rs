@@ -213,3 +213,27 @@ async fn resting_orders_can_be_listed_and_cancelled(pool: PgPool) {
     assert_eq!(code(&t.get_account("manual".into()).await.unwrap_err()), "UNKNOWN_ACCOUNT");
     assert_eq!(code(&t.list_orders("manual".into(), None, None).await.unwrap_err()), "UNKNOWN_ACCOUNT");
 }
+
+#[sqlx::test]
+async fn restart_restores_cash_positions_and_open_orders(pool: PgPool) {
+    let (app, t) = rig(pool).await;
+    t.place_order(buy("bot", Some(dec!(0.1)), "entry")).await.unwrap();
+    let mut o = buy("bot", Some(dec!(0.1)), "resting bid");
+    o.kind = KindDto::Limit;
+    o.limit_price = Some(dec!(99000000));
+    let resting = t.place_order(o).await.unwrap().order;
+    t.convert_currency("bot".into(), "KRW".into(), "USD".into(), dec!(1400000)).await.unwrap();
+    for _ in 0..100 {
+        if app.store.orders("bot", 1, true, 10).await.unwrap().len() == 1 && app.store.cash_balances("bot", 1).await.unwrap().contains_key(&Currency::Usd) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let before = app.broker.portfolio("bot").unwrap();
+
+    let clock = ManualClock::new(Utc.with_ymd_and_hms(2026, 9, 23, 1, 0, 0).unwrap());
+    let fresh = SimBroker::new(Arc::new(clock), Calendar::default());
+    assert_eq!(restore(&app.store, &fresh).await.unwrap(), 2);
+    assert_eq!(fresh.portfolio("bot").unwrap(), before);
+    assert_eq!(fresh.order(resting.id).unwrap().status, atrader::broker::OrderStatus::Open);
+}

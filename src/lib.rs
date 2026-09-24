@@ -8,6 +8,7 @@ pub mod market;
 pub mod persist;
 pub mod app;
 pub mod broker;
+pub mod cli;
 pub mod store;
 pub mod subs;
 pub mod tools;

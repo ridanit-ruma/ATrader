@@ -7,7 +7,10 @@ node. It gives an Attacca agent the tools to research markets and trade on paper
 real-time market data, and it gives you a private dashboard showing every trade, the agent's
 reason for it, and how each account is doing.
 
-> **Status:** early design. Nothing runs yet. See the [design spec](docs/superpowers/specs/2026-09-24-atrader-design.md).
+> **Status:** crypto paper trading (Upbit, Binance) works end to end through zyris. Korean
+> and US stocks, research tools, alerts and the dashboard are still in progress. See the
+> [design spec](docs/superpowers/specs/2026-09-24-atrader-design.md) and
+> [plans](docs/superpowers/plans/).
 
 ## What it does
 
@@ -29,6 +32,29 @@ reason for it, and how each account is doing.
   authentication and is served only on your Tailscale network.
 - **Ready for real brokers.** Execution sits behind a `Broker` trait. Connecting a real brokerage
   account is planned but not built.
+
+## Running
+
+You need Rust and Postgres. For a throwaway local database, `scripts/dev-db.sh` starts one
+through nix and prints a `DATABASE_URL`.
+
+```bash
+export DATABASE_URL=postgres://atrader@127.0.0.1:54329/atrader
+
+# Create an account. --agent is the id of the Attacca agent that trades it; the agent cannot
+# see accounts without one.
+atrader account create bot "Momentum bot" --agent <attacca-agent-id> --cash KRW=10000000 --cash USDT=7000
+atrader account list
+
+# Serve the zyris `trader` capability. Issue the credential in Attacca under /settings/zyris.
+ZYRIS_CREDENTIAL=zc_... atrader serve
+
+# Or run the simulator and market data without connecting to Attacca.
+atrader serve --no-zyris
+```
+
+`atrader account reset <id>` starts an account over. Its history is kept, and a running server
+picks up the reset after a restart.
 
 ## Stack
 

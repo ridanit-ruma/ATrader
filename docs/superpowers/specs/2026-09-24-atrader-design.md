@@ -358,8 +358,10 @@ Migrations are plain SQL under `migrations/`, run at startup through `sqlx::migr
 - **A zyris disconnect** triggers reconnect with backoff (the runner from `zyris-docker`).
   Trading and the dashboard keep working.
 - **Order processing** runs per instrument on one task (an actor), so the book, reservations
-  and fills never race. Each fill's ledger write is one DB transaction, and a failed write
-  reverses the in-memory fill.
+  and fills never race. Every change is journaled, and a writer task persists the journal
+  in order, with each fill's ledger write as one DB transaction. A failed write is retried up
+  to 10 times; after that the event is logged and skipped. In-memory state is never rolled
+  back.
 - **Tool errors** return typed codes (`MARKET_CLOSED`, `STALE_DATA`, `INVALID_TICK`,
   `INSUFFICIENT_FUNDS`, `UNKNOWN_INSTRUMENT`, `NOT_FOUND`, `RATE_LIMITED`, `UPSTREAM_ERROR`) with
   recovery fields. They never return raw upstream errors.

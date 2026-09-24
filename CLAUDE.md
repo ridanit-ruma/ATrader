@@ -7,6 +7,9 @@ Spec: `docs/superpowers/specs/2026-09-24-atrader-design.md`. Plans: `docs/superp
 
 - Build and test (no DB): `cargo test --lib --test broker`
 - Local Postgres: `scripts/dev-db.sh` prints a `DATABASE_URL`; export it, then `cargo test`
+- Run without Attacca: `cargo run -- serve --no-zyris` (needs `DATABASE_URL`; the dev DB also has an `atrader` database: `createdb -h 127.0.0.1 -p 54329 -U atrader atrader`)
+- Accounts: `cargo run -- account create <id> <name> --agent <agent-id>`, `cargo run -- account list`
+- Live network smoke tests: `cargo test --test live -- --ignored`
 - Stop Postgres: `nix shell nixpkgs#postgresql_16 -c pg_ctl -D .dev/pg stop`
 
 ## Conventions
