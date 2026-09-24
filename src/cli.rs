@@ -33,7 +33,7 @@ USAGE:
 ENVIRONMENT:
   DATABASE_URL          Postgres connection string (required)
   ZYRIS_CREDENTIAL      zc_ credential issued in Attacca (/settings/zyris), or
-  ZYRIS_CREDENTIAL_FILE file holding it
+  ZYRIS_CREDENTIAL_FILE file holding it (every secret below also takes a NAME_FILE variant)
   ZYRIS_SERVER_URL      zyris server (default: Attacca's)
   ATRADER_NODE_NAME     node name shown in Attacca (default: atrader)
   KIS_APP_KEY, KIS_APP_SECRET  KIS Open API keys (enable KRX and US stocks)
@@ -130,7 +130,7 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
         .init();
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async move {
-        let url = std::env::var("DATABASE_URL").context("DATABASE_URL is not set")?;
+        let url = crate::secret_env("DATABASE_URL").context("DATABASE_URL (or DATABASE_URL_FILE) is not set")?;
         let store = Arc::new(Store::connect(&url).await?);
         match command {
             Command::AccountCreate { id, name, agent, cash } => {
@@ -183,18 +183,9 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
 }
 
 fn credential() -> anyhow::Result<String> {
-    if let Ok(c) = std::env::var("ZYRIS_CREDENTIAL") {
-        if !c.trim().is_empty() {
-            return Ok(c.trim().to_string());
-        }
-    }
-    if let Ok(path) = std::env::var("ZYRIS_CREDENTIAL_FILE") {
-        let c = std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
-        return Ok(c.trim().to_string());
-    }
-    Err(anyhow!(
-        "no zyris credential: set ZYRIS_CREDENTIAL (issue one in Attacca under /settings/zyris) or run `atrader serve --no-zyris`"
-    ))
+    crate::secret_env("ZYRIS_CREDENTIAL").ok_or_else(|| {
+        anyhow!("no zyris credential: set ZYRIS_CREDENTIAL (issue one in Attacca under /settings/zyris) or run `atrader serve --no-zyris`")
+    })
 }
 
 async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
@@ -235,7 +226,7 @@ async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
     tokio::spawn(pump(events_rx, broker.clone(), bus.clone()));
     let writer = tokio::spawn(persist(journal_rx, store.clone(), bus.clone()));
     tokio::spawn(crate::app::bar_loop(bus.subscribe(), store.clone()));
-    let dart = std::env::var("DART_API_KEY").ok().filter(|k| !k.trim().is_empty()).map(|k| crate::fundamentals::dart::DartClient::new(k.trim().into()));
+    let dart = crate::secret_env("DART_API_KEY").map(crate::fundamentals::dart::DartClient::new);
     let edgar = std::env::var("EDGAR_USER_AGENT").ok().filter(|u| !u.trim().is_empty()).map(|u| crate::fundamentals::edgar::EdgarClient::new(u.trim().into()));
     tracing::info!(dart = dart.is_some(), edgar = edgar.is_some(), "fundamentals sources");
     let app = Arc::new(App::new(broker.clone(), store, market, FxCache::new()).await?.with_fundamentals(dart, edgar).with_alerts(alert_tx));

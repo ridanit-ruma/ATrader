@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import type { Health, OverviewRow } from "./types";
+import type { Health, OverviewRow } from "@/types";
 
 /** Live updates from `/api/stream`: fills and orders refresh their account, equity ticks patch the overview. */
 export function useLiveStream(enabled: boolean) {

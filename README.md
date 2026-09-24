@@ -81,6 +81,37 @@ tailscale serve --bg --https=443 http://127.0.0.1:8750
 Lost the authenticator? `atrader user reset-2fa <name>` turns the second factor off and signs every
 session out; the next sign-in enrols again.
 
+## Deploying on NixOS
+
+The flake provides a package and a module. The module runs `atrader` as a hardened systemd service
+with a local Postgres database. Secrets are passed as systemd credentials, so they never enter the
+Nix store:
+
+```nix
+{
+  inputs.atrader.url = "github:ridanit-ruma/ATrader";
+  # in your nixosSystem modules:
+  #   atrader.nixosModules.default
+  #   {
+  #     services.atrader = {
+  #       enable = true;
+  #       tailscaleServe = true; # https://<machine>.<tailnet>.ts.net
+  #       credentials = {
+  #         ZYRIS_CREDENTIAL = "/var/lib/secrets/atrader-zyris";
+  #         KIS_APP_KEY = "/var/lib/secrets/kis-app-key";
+  #         KIS_APP_SECRET = "/var/lib/secrets/kis-app-secret";
+  #         DART_API_KEY = "/var/lib/secrets/dart-api-key";
+  #       };
+  #       environment.EDGAR_USER_AGENT = "ATrader you@example.com";
+  #     };
+  #   }
+}
+```
+
+Then create the login and accounts with `atrader-manage`, which runs the CLI as the service user:
+`sudo atrader-manage user create <name>`, `sudo atrader-manage account create ...`.
+`nix build .#checks.x86_64-linux.vm` boots the module in a VM and checks it end to end.
+
 ## Alerts
 
 The agent can set alerts (price levels, % moves, volume surges, its own fills, market open and

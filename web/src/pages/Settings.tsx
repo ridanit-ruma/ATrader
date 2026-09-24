@@ -1,26 +1,43 @@
 import { useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, type Cash } from "../api";
-import { setColorScheme, useColorScheme } from "../colors";
-import { fmtTime } from "../format";
-import { ErrorText, Section, Table } from "../components/ui";
+import { api, type Cash } from "@/api";
+import { setColorScheme, useColorScheme } from "@/colors";
+import type { ColorScheme } from "@/format";
+import { fmtTime } from "@/format";
+import { DataTable, ErrorText, Muted, Section, PageHeader } from "@/components/common";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { TableCell, TableRow } from "@/components/ui/table";
 
 const CURRENCIES = ["KRW", "USD", "USDT"] as const;
 
-function CashInputs({ cash, onChange }: { cash: Cash; onChange: (c: Cash) => void }) {
+function Field({ id, label, ...props }: { id: string; label: string } & React.ComponentProps<typeof Input>) {
+  return (
+    <div className="grid gap-2">
+      <Label htmlFor={id}>{label}</Label>
+      <Input id={id} {...props} />
+    </div>
+  );
+}
+
+function CashInputs({ prefix, cash, onChange }: { prefix: string; cash: Cash; onChange: (c: Cash) => void }) {
   return (
     <div className="grid grid-cols-3 gap-2">
       {CURRENCIES.map((c) => (
-        <label key={c} className="text-xs text-zinc-500">
-          {c}
-          <input className="input" inputMode="decimal" value={cash[c] ?? ""} onChange={(e) => onChange({ ...cash, [c]: e.target.value })} />
-        </label>
+        <Field key={c} id={`${prefix}-${c}`} label={`${c} 현금`} inputMode="decimal" value={cash[c] ?? ""} onChange={(e) => onChange({ ...cash, [c]: e.target.value })} />
       ))}
     </div>
   );
 }
 
 const nonEmpty = (cash: Cash): Cash => Object.fromEntries(Object.entries(cash).filter(([, v]) => v.trim() !== "").map(([k, v]) => [k, v.trim()]));
+
+function Done({ show, children }: { show: boolean; children: string }) {
+  return show ? <p className="text-sm text-green-600 dark:text-green-400">{children}</p> : null;
+}
 
 function CreateAccount() {
   const qc = useQueryClient();
@@ -39,18 +56,18 @@ function CreateAccount() {
   };
   return (
     <Section title="계좌 만들기">
-      <form onSubmit={submit} className="space-y-2">
+      <form onSubmit={submit} className="grid gap-4">
         <div className="grid gap-2 md:grid-cols-3">
-          <input className="input" placeholder="id (a-z, 0-9, _, -)" value={f.id} onChange={(e) => setF({ ...f, id: e.target.value })} required />
-          <input className="input" placeholder="이름" value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} required />
-          <input className="input" placeholder="Attacca 에이전트 id (선택)" value={f.agent} onChange={(e) => setF({ ...f, agent: e.target.value })} />
+          <Field id="new-id" label="id (a-z, 0-9, _, -)" value={f.id} onChange={(e) => setF({ ...f, id: e.target.value })} required />
+          <Field id="new-name" label="이름" value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} required />
+          <Field id="new-agent" label="Attacca 에이전트 id (선택)" value={f.agent} onChange={(e) => setF({ ...f, agent: e.target.value })} />
         </div>
-        <CashInputs cash={cash} onChange={setCash} />
+        <CashInputs prefix="new" cash={cash} onChange={setCash} />
         <ErrorText error={m.error} />
-        {m.isSuccess && <p className="text-sm text-green-600">만들었습니다.</p>}
-        <button className="btn" disabled={m.isPending}>
+        <Done show={m.isSuccess}>만들었습니다.</Done>
+        <Button type="submit" className="w-fit" disabled={m.isPending}>
           만들기
-        </button>
+        </Button>
       </form>
     </Section>
   );
@@ -59,35 +76,40 @@ function CreateAccount() {
 function ResetAccount() {
   const qc = useQueryClient();
   const overview = useQuery({ queryKey: ["overview"], queryFn: api.overview });
-  const [id, setId] = useState("");
+  const [id, setId] = useState<string | null>(null);
   const [confirm, setConfirm] = useState("");
   const [cash, setCash] = useState<Cash>({ KRW: "10000000" });
   const m = useMutation({
-    mutationFn: () => api.resetAccount(id, nonEmpty(cash)),
+    mutationFn: () => api.resetAccount(id!, nonEmpty(cash)),
     onSuccess: () => {
       qc.invalidateQueries();
       setConfirm("");
     },
   });
+  const items = (overview.data ?? []).map((a) => ({ value: a.id, label: `${a.summary.name} (${a.id})` }));
   return (
     <Section title="계좌 초기화">
-      <p className="mb-2 text-sm text-zinc-500">보유 종목과 미체결 주문을 모두 지우고 입력한 현금으로 다시 시작합니다. 이전 기록은 남습니다.</p>
-      <div className="space-y-2">
-        <select className="input" value={id} onChange={(e) => setId(e.target.value)}>
-          <option value="">계좌 선택</option>
-          {overview.data?.map((a) => (
-            <option key={a.id} value={a.id}>
-              {a.summary.name} ({a.id})
-            </option>
-          ))}
-        </select>
-        <CashInputs cash={cash} onChange={setCash} />
-        <input className="input" placeholder="확인을 위해 계좌 id를 입력하세요" value={confirm} onChange={(e) => setConfirm(e.target.value)} />
+      <div className="grid gap-4">
+        <Muted>보유 종목과 미체결 주문을 모두 지우고 입력한 현금으로 다시 시작합니다. 이전 기록은 남습니다.</Muted>
+        <Select items={items} value={id} onValueChange={(v) => setId(v as string | null)}>
+          <SelectTrigger className="w-64">
+            <SelectValue placeholder="계좌 선택" />
+          </SelectTrigger>
+          <SelectContent>
+            {items.map((i) => (
+              <SelectItem key={i.value} value={i.value}>
+                {i.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <CashInputs prefix="reset" cash={cash} onChange={setCash} />
+        <Field id="reset-confirm" label="확인을 위해 계좌 id를 입력하세요" value={confirm} onChange={(e) => setConfirm(e.target.value)} />
         <ErrorText error={m.error} />
-        {m.isSuccess && <p className="text-sm text-green-600">초기화했습니다.</p>}
-        <button className="btn" disabled={!id || confirm !== id || m.isPending} onClick={() => m.mutate()}>
+        <Done show={m.isSuccess}>초기화했습니다.</Done>
+        <Button variant="destructive" className="w-fit" disabled={!id || confirm !== id || m.isPending} onClick={() => m.mutate()}>
           초기화
-        </button>
+        </Button>
       </div>
     </Section>
   );
@@ -102,16 +124,16 @@ function Password() {
   };
   return (
     <Section title="비밀번호 변경">
-      <form onSubmit={submit} className="space-y-2">
-        <input className="input" type="password" autoComplete="current-password" placeholder="현재 비밀번호" value={f.current} onChange={(e) => setF({ ...f, current: e.target.value })} required />
-        <input className="input" type="password" autoComplete="new-password" placeholder="새 비밀번호 (12자 이상)" minLength={12} value={f.next} onChange={(e) => setF({ ...f, next: e.target.value })} required />
-        <input className="input" type="password" autoComplete="new-password" placeholder="새 비밀번호 확인" value={f.again} onChange={(e) => setF({ ...f, again: e.target.value })} required />
-        {f.again && f.next !== f.again && <p className="text-sm text-red-600">새 비밀번호가 서로 다릅니다.</p>}
+      <form onSubmit={submit} className="grid max-w-sm gap-4">
+        <Field id="pw-current" label="현재 비밀번호" type="password" autoComplete="current-password" value={f.current} onChange={(e) => setF({ ...f, current: e.target.value })} required />
+        <Field id="pw-new" label="새 비밀번호 (12자 이상)" type="password" autoComplete="new-password" minLength={12} value={f.next} onChange={(e) => setF({ ...f, next: e.target.value })} required />
+        <Field id="pw-again" label="새 비밀번호 확인" type="password" autoComplete="new-password" value={f.again} onChange={(e) => setF({ ...f, again: e.target.value })} required />
+        {f.again && f.next !== f.again && <ErrorText error="새 비밀번호가 서로 다릅니다." />}
         <ErrorText error={m.error} />
-        {m.isSuccess && <p className="text-sm text-green-600">바꿨습니다. 다른 기기의 세션은 모두 로그아웃되었습니다.</p>}
-        <button className="btn" disabled={m.isPending}>
+        <Done show={m.isSuccess}>바꿨습니다. 다른 기기의 세션은 모두 로그아웃되었습니다.</Done>
+        <Button type="submit" className="w-fit" disabled={m.isPending}>
           변경
-        </button>
+        </Button>
       </form>
     </Section>
   );
@@ -123,53 +145,68 @@ function Sessions() {
   const revoke = useMutation({ mutationFn: api.revoke, onSuccess: () => qc.invalidateQueries({ queryKey: ["sessions"] }) });
   return (
     <Section title="로그인 세션">
-      <Table head={["기기", "IP", "로그인", "마지막 사용", ""]} empty={!q.data?.length}>
+      <DataTable head={["기기", "IP", "로그인", "마지막 사용", ""]} empty={!q.data?.length}>
         {q.data?.map((s) => (
-          <tr key={s.id}>
-            <td className="max-w-xs truncate px-2 py-1 text-xs" title={s.user_agent}>
+          <TableRow key={s.id}>
+            <TableCell className="max-w-xs truncate text-xs" title={s.user_agent}>
               {s.user_agent || "—"}
-            </td>
-            <td className="num px-2">{s.ip}</td>
-            <td className="num px-2 text-xs">{fmtTime(s.created_at)}</td>
-            <td className="num px-2 text-xs">{fmtTime(s.last_seen)}</td>
-            <td className="num px-2">
+            </TableCell>
+            <TableCell className="text-right">{s.ip}</TableCell>
+            <TableCell className="text-right text-xs">{fmtTime(s.created_at)}</TableCell>
+            <TableCell className="text-right text-xs">{fmtTime(s.last_seen)}</TableCell>
+            <TableCell className="text-right">
               {s.current ? (
-                <span className="text-xs text-zinc-500">현재 세션</span>
+                <Badge variant="secondary">현재 세션</Badge>
               ) : (
-                <button className="btn-quiet text-xs" onClick={() => revoke.mutate(s.id)}>
+                <Button variant="outline" size="sm" onClick={() => revoke.mutate(s.id)}>
                   종료
-                </button>
+                </Button>
               )}
-            </td>
-          </tr>
+            </TableCell>
+          </TableRow>
         ))}
-      </Table>
+      </DataTable>
     </Section>
   );
 }
+
+const SCHEMES = [
+  { value: "red-up", label: "상승 빨강 · 하락 파랑" },
+  { value: "green-up", label: "상승 초록 · 하락 빨강" },
+];
 
 function Status() {
   const health = useQuery({ queryKey: ["health"], queryFn: api.health });
   const scheme = useColorScheme();
   return (
     <Section title="상태와 표시">
-      <div className="space-y-3 text-sm">
-        <p>Attacca 에이전트 연결: {health.data?.zyris_connected ? "연결됨" : "연결 안 됨"}</p>
-        <div className="flex flex-wrap gap-3">
+      <div className="grid gap-4 text-sm">
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge variant={health.data?.zyris_connected ? "default" : "outline"}>Attacca {health.data?.zyris_connected ? "연결됨" : "연결 안 됨"}</Badge>
           {health.data?.feeds.map((f) => (
-            <span key={f.venue} className="btn-quiet">
+            <Badge key={f.venue} variant="secondary">
               {f.venue} · 구독 {f.subscribed}종목
-            </span>
+            </Badge>
           ))}
         </div>
-        <label className="flex items-center gap-2">
-          색상
-          <select className="input w-auto" value={scheme} onChange={(e) => setColorScheme(e.target.value as typeof scheme)}>
-            <option value="red-up">상승 빨강 · 하락 파랑</option>
-            <option value="green-up">상승 초록 · 하락 빨강</option>
-          </select>
-        </label>
-        <p className="text-zinc-500">2단계 인증을 초기화하려면 서버에서 <code>atrader user reset-2fa &lt;이름&gt;</code>을 실행하세요.</p>
+        <div className="grid gap-2">
+          <Label>색상</Label>
+          <Select items={SCHEMES} value={scheme} onValueChange={(v) => v && setColorScheme(v as ColorScheme)}>
+            <SelectTrigger className="w-64">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {SCHEMES.map((s) => (
+                <SelectItem key={s.value} value={s.value}>
+                  {s.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        <Muted>
+          2단계 인증을 초기화하려면 서버에서 <code>atrader user reset-2fa &lt;이름&gt;</code>을 실행하세요.
+        </Muted>
       </div>
     </Section>
   );
@@ -179,23 +216,24 @@ function Audit() {
   const q = useQuery({ queryKey: ["audit"], queryFn: api.audit });
   return (
     <Section title="감사 기록">
-      <Table head={["시각", "동작", "내용", "IP"]} empty={!q.data?.length}>
+      <DataTable head={["시각", "동작", "내용", "IP"]} empty={!q.data?.length}>
         {q.data?.map((r, i) => (
-          <tr key={i}>
-            <td className="px-2 py-1 text-xs whitespace-nowrap">{fmtTime(r.at)}</td>
-            <td className="num px-2">{r.action}</td>
-            <td className="num px-2">{r.detail}</td>
-            <td className="num px-2">{r.ip}</td>
-          </tr>
+          <TableRow key={i}>
+            <TableCell className="text-xs">{fmtTime(r.at)}</TableCell>
+            <TableCell className="text-right">{r.action}</TableCell>
+            <TableCell className="text-right">{r.detail}</TableCell>
+            <TableCell className="text-right">{r.ip}</TableCell>
+          </TableRow>
         ))}
-      </Table>
+      </DataTable>
     </Section>
   );
 }
 
 export function Settings() {
   return (
-    <div className="space-y-4">
+    <div className="grid gap-4">
+      <PageHeader title="설정" description="계좌, 보안, 표시 설정" />
       <CreateAccount />
       <ResetAccount />
       <Status />

@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from "react";
-import type { ColorScheme } from "./format";
+import type { ColorScheme } from "@/format";
 
 const KEY = "atrader.colors";
 const listeners = new Set<() => void>();
