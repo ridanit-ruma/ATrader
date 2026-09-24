@@ -6,7 +6,9 @@
 
 **Architecture:** Vite + React + TypeScript in `web/`. TanStack Query owns server state; one SSE hook
 invalidates queries and patches live equity. `lightweight-charts` draws the equity curve, daily PnL
-bars and candles. Tailwind v4 through its Vite plugin. No component library, no state library.
+bars and candles. Tailwind v4 through its Vite plugin. No state library.
+
+> **Changed during implementation:** the UI follows shadcn/ui (components under `web/src/components/ui`, neutral theme tokens, section-card metrics), at the user's request.
 
 **Tech stack:** react 19, react-router 7 (library mode, `createBrowserRouter`), @tanstack/react-query 5,
 lightweight-charts 5, tailwindcss 4 + @tailwindcss/vite, qrcode (TOTP enrolment QR as a data URL,

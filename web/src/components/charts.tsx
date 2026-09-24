@@ -10,14 +10,20 @@ import {
   type Time,
   type UTCTimestamp,
 } from "lightweight-charts";
-import { useColorScheme } from "../colors";
-import { chartColors } from "../format";
-import type { CandleView, Chart, EquityPoint, Pnl } from "../types";
+import { useColorScheme } from "@/colors";
+import { chartColors, fmtNum } from "@/format";
+import type { CandleView, Chart, EquityPoint, Pnl } from "@/types";
 
 const ts = (iso: string) => Math.floor(new Date(iso).getTime() / 1000) as UTCTimestamp;
 
-function dark() {
-  return window.matchMedia("(prefers-color-scheme: dark)").matches;
+/** A theme token (`--border`, `--primary`, ...) as rgb(), which lightweight-charts can parse; the
+ * tokens themselves are oklch. */
+function token(name: string, alpha = 1): string {
+  const ctx = document.createElement("canvas").getContext("2d")!;
+  ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue(name).trim() || "#888";
+  ctx.fillRect(0, 0, 1, 1);
+  const [r, g, b] = ctx.getImageData(0, 0, 1, 1).data;
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 
 /** Mount a chart into a div, rebuild it when `deps` change. */
@@ -25,13 +31,13 @@ function useChart(build: (chart: IChartApi) => void, deps: unknown[]) {
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!ref.current) return;
-    const d = dark();
     const chart = createChart(ref.current, {
       autoSize: true,
-      layout: { background: { type: ColorType.Solid, color: "transparent" }, textColor: d ? "#a1a1aa" : "#52525b" },
-      grid: { vertLines: { color: d ? "#27272a" : "#f4f4f5" }, horzLines: { color: d ? "#27272a" : "#f4f4f5" } },
-      timeScale: { timeVisible: true },
-      localization: { locale: "ko-KR" },
+      layout: { background: { type: ColorType.Solid, color: "transparent" }, textColor: token("--muted-foreground"), fontFamily: getComputedStyle(document.body).fontFamily },
+      grid: { vertLines: { visible: false }, horzLines: { color: token("--border") } },
+      rightPriceScale: { borderVisible: false },
+      timeScale: { timeVisible: true, borderVisible: false },
+      localization: { locale: "ko-KR", priceFormatter: (p: number) => fmtNum(Math.abs(p) >= 1000 ? Math.round(p) : p) },
     });
     build(chart);
     chart.timeScale().fitContent();
@@ -44,7 +50,7 @@ function useChart(build: (chart: IChartApi) => void, deps: unknown[]) {
 export function EquityChart({ points }: { points: EquityPoint[] }) {
   const ref = useChart(
     (chart) => {
-      const s = chart.addSeries(AreaSeries, { lineColor: "#6366f1", topColor: "#6366f155", bottomColor: "#6366f105", lineWidth: 2 });
+      const s = chart.addSeries(AreaSeries, { lineColor: token("--primary"), topColor: token("--primary", 0.25), bottomColor: token("--primary", 0), lineWidth: 2 });
       s.setData(dedupe(points.map((p) => ({ time: ts(p.at), value: Number(p.equity_krw) }))));
     },
     [points],
