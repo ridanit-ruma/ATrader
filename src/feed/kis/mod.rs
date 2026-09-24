@@ -48,8 +48,8 @@ impl KisConfig {
     /// `KIS_APP_KEY` + `KIS_APP_SECRET` (both required), `KIS_ENV=mock` for mock hosts,
     /// `ATRADER_STATE_DIR` for the token cache.
     pub fn from_env() -> Option<KisConfig> {
-        let app_key = std::env::var("KIS_APP_KEY").ok().filter(|s| !s.trim().is_empty())?;
-        let app_secret = std::env::var("KIS_APP_SECRET").ok().filter(|s| !s.trim().is_empty())?;
+        let app_key = crate::secret_env("KIS_APP_KEY")?;
+        let app_secret = crate::secret_env("KIS_APP_SECRET")?;
         let mock = std::env::var("KIS_ENV").is_ok_and(|v| v.eq_ignore_ascii_case("mock"));
         Some(KisConfig { app_key: app_key.trim().into(), app_secret: app_secret.trim().into(), mock, state_dir: state_dir() })
     }
