@@ -223,7 +223,7 @@ struct Plan {
 
 /// Cash reserved per unit of a resting buy: limit price plus commission.
 fn buy_reserve_per_unit(limit: Decimal, venue: Venue) -> Decimal {
-    limit * (dec!(1) + FeeSchedule::default_for(venue).commission_bps / dec!(10000))
+    limit * (dec!(1) + FeeSchedule::latest(venue).commission_bps / dec!(10000))
 }
 
 /// Above any real order, far below `Decimal` overflow once multiplied together.
@@ -263,7 +263,7 @@ fn is_complete(o: &Order) -> bool {
 fn record_fill(w: &mut World, order: &mut Order, qty: Decimal, notional: Decimal, liquidity: Liquidity, now: DateTime<Utc>) -> Fill {
     let id = order.req.instrument.clone();
     let venue = id.venue;
-    let (fee, tax) = FeeSchedule::default_for(venue).cost(order.req.side, notional, venue.currency().decimals());
+    let (fee, tax) = FeeSchedule::at(venue, now).cost(order.req.side, notional, venue.currency().decimals());
     let pf = w.accounts.get_mut(&order.account).expect("order's account exists");
     let realized_pnl = pf.apply_fill(&id, order.req.side, qty, notional, fee, tax);
     order.filled_qty += qty;
@@ -829,7 +829,7 @@ impl SimBroker {
             _ => {}
         }
 
-        let fees = FeeSchedule::default_for(venue);
+        let fees = FeeSchedule::at(venue, now);
         let (opposite, own, band) = match req.side {
             Side::Buy => (&asks, &bids, dec!(1) + params.max_slippage),
             Side::Sell => (&bids, &asks, dec!(1) - params.max_slippage),

@@ -1,0 +1,25 @@
+# Fees and taxes per venue, in basis points of notional. Each [[VENUE]] entry applies from its
+# `from` date (the venue's local date) until the next entry. Tax rates change by law: add a new
+# entry dated when the change takes effect rather than editing an old one, then rebuild.
+#
+# commission_bps    charged on every execution
+# sell_tax_bps      charged on sells (KRX securities transaction tax)
+# sell_reg_fee_bps  added to the fee on sells (US SEC fee)
+
+[[KRX]]
+from = "2026-01-01"
+commission_bps = 1.5
+sell_tax_bps = 20
+
+[[US]]
+from = "2026-01-01"
+commission_bps = 0
+sell_reg_fee_bps = 0.278
+
+[[UPBIT]]
+from = "2026-01-01"
+commission_bps = 5
+
+[[BINANCE]]
+from = "2026-01-01"
+commission_bps = 10

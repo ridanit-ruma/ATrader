@@ -120,25 +120,72 @@ pub fn price_band(venue: Venue, tick: &TickRule, prev_close: Option<Decimal>) ->
     Some((tick.ceil(p * dec!(0.7)), tick.floor(p * dec!(1.3))))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
 pub struct FeeSchedule {
+    #[serde(default)]
     pub commission_bps: Decimal,
+    #[serde(default)]
     pub sell_tax_bps: Decimal,
+    #[serde(default)]
     pub sell_reg_fee_bps: Decimal,
 }
 
+/// Each venue's schedules, oldest first.
+type FeeTable = HashMap<Venue, Vec<(NaiveDate, FeeSchedule)>>;
+
+static FEES: std::sync::LazyLock<FeeTable> = std::sync::LazyLock::new(|| parse_fees(include_str!("../fees.toml")).expect("fees.toml is valid"));
+
+/// Parse `[[VENUE]]` entries of `from` (a local date) plus basis-point rates; every venue needs one.
+pub fn parse_fees(src: &str) -> anyhow::Result<FeeTable> {
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        from: NaiveDate,
+        #[serde(flatten)]
+        fees: FeeSchedule,
+    }
+    let raw: HashMap<String, Vec<Entry>> = toml::from_str(src)?;
+    let mut table = FeeTable::new();
+    for (tag, entries) in raw {
+        let venue = Venue::from_tag(&tag).ok_or_else(|| anyhow::anyhow!("unknown venue {tag:?}"))?;
+        let mut v: Vec<_> = entries.into_iter().map(|e| (e.from, e.fees)).collect();
+        v.sort_by_key(|(d, _)| *d);
+        table.insert(venue, v);
+    }
+    for venue in [Venue::Krx, Venue::Us, Venue::Upbit, Venue::Binance] {
+        anyhow::ensure!(table.get(&venue).is_some_and(|v| !v.is_empty()), "fees.toml has no schedule for {}", venue.tag());
+    }
+    Ok(table)
+}
+
+fn local_date(venue: Venue, now: DateTime<Utc>) -> NaiveDate {
+    match venue {
+        Venue::Krx | Venue::Upbit => now.with_timezone(&chrono_tz::Asia::Seoul).date_naive(),
+        Venue::Us => now.with_timezone(&chrono_tz::America::New_York).date_naive(),
+        Venue::Binance => now.date_naive(),
+    }
+}
+
+fn pick(t: &FeeTable, venue: Venue, now: DateTime<Utc>) -> FeeSchedule {
+    let v = &t[&venue];
+    let day = local_date(venue, now);
+    // Before the first entry, the first one applies.
+    v.iter().rev().find(|(from, _)| *from <= day).unwrap_or(&v[0]).1
+}
+
+fn latest(t: &FeeTable, venue: Venue) -> FeeSchedule {
+    t[&venue].last().expect("parse_fees checks every venue").1
+}
+
 impl FeeSchedule {
-    /// Defaults per spec §3. The KRX securities transaction tax (20 bps) follows the law in force
-    /// for 2026; check it when the law changes.
-    // ponytail: hard-coded defaults; fees.toml with effective dates lands in Phase 8.
-    pub fn default_for(venue: Venue) -> Self {
-        let (commission_bps, sell_tax_bps, sell_reg_fee_bps) = match venue {
-            Venue::Krx => (dec!(1.5), dec!(20), dec!(0)),
-            Venue::Us => (dec!(0), dec!(0), dec!(0.278)),
-            Venue::Upbit => (dec!(5), dec!(0), dec!(0)),
-            Venue::Binance => (dec!(10), dec!(0), dec!(0)),
-        };
-        FeeSchedule { commission_bps, sell_tax_bps, sell_reg_fee_bps }
+    /// The schedule in force at `now` on `venue`'s local date (see `fees.toml`).
+    pub fn at(venue: Venue, now: DateTime<Utc>) -> Self {
+        pick(&FEES, venue, now)
+    }
+
+    /// The newest schedule. Cash reserved for resting buys uses it, so a reservation and its
+    /// release always agree; `restore` recomputes reservations after `fees.toml` changes.
+    pub fn latest(venue: Venue) -> Self {
+        latest(&FEES, venue)
     }
 
     /// (fee, tax) for one execution of `notional`, truncated to `dp` decimal places (brokers drop
@@ -266,13 +313,32 @@ mod tests {
     }
 
     #[test]
+    fn fees_follow_their_effective_date() {
+        let t = parse_fees(
+            "[[KRX]]\nfrom = \"2025-01-01\"\ncommission_bps = 1.5\nsell_tax_bps = 15\n\n\
+             [[KRX]]\nfrom = \"2026-01-01\"\ncommission_bps = 1.5\nsell_tax_bps = 20\n\n\
+             [[US]]\nfrom = \"2025-01-01\"\nsell_reg_fee_bps = 0.278\n\n\
+             [[UPBIT]]\nfrom = \"2025-01-01\"\ncommission_bps = 5\n\n\
+             [[BINANCE]]\nfrom = \"2025-01-01\"\ncommission_bps = 10\n",
+        )
+        .unwrap();
+        assert_eq!(pick(&t, Venue::Krx, utc(2025, 12, 31, 14, 0)).sell_tax_bps, dec!(15));
+        // KRX dates are Seoul dates: 2025-12-31 15:00 UTC is already 2026-01-01 in Seoul.
+        assert_eq!(pick(&t, Venue::Krx, utc(2025, 12, 31, 15, 0)).sell_tax_bps, dec!(20));
+        assert_eq!(latest(&t, Venue::Krx).sell_tax_bps, dec!(20));
+        assert!(parse_fees("[[KRX]]\nfrom = \"2025-01-01\"\ncommission_bps = 1\n").is_err(), "every venue needs a schedule");
+        assert!(parse_fees("[[NASDAQ]]\nfrom = \"2025-01-01\"\n").is_err());
+    }
+
+    #[test]
     fn fees_and_taxes() {
-        let krx = FeeSchedule::default_for(Venue::Krx);
+        let now = utc(2026, 9, 25, 0, 0);
+        let krx = FeeSchedule::at(Venue::Krx, now);
         assert_eq!(krx.cost(Side::Sell, dec!(1000000), 0), (dec!(150), dec!(2000)));
         assert_eq!(krx.cost(Side::Buy, dec!(1000000), 0), (dec!(150), dec!(0)));
-        let us = FeeSchedule::default_for(Venue::Us);
+        let us = FeeSchedule::at(Venue::Us, now);
         assert_eq!(us.cost(Side::Sell, dec!(10000), 2), (dec!(0.27), dec!(0)));
-        let upbit = FeeSchedule::default_for(Venue::Upbit);
+        let upbit = FeeSchedule::at(Venue::Upbit, now);
         assert_eq!(upbit.cost(Side::Buy, dec!(1000000), 0), (dec!(500), dec!(0)));
     }
 
