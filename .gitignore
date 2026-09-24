@@ -1,3 +1,6 @@
 /target
 /.dev
 /.superpowers
+web/node_modules/
+web/dist/
+.playwright-mcp/
