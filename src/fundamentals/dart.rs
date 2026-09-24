@@ -207,7 +207,9 @@ impl DartClient {
     async fn bytes(&self, path: &str, query: &[(&str, &str)]) -> anyhow::Result<Vec<u8>> {
         let mut q = vec![("crtfc_key", self.key.as_str())];
         q.extend_from_slice(query);
-        Ok(self.http.get(format!("{BASE}/{path}")).query(&q).send().await?.error_for_status()?.bytes().await?.to_vec())
+        // reqwest errors embed the request URL, which carries the API key: strip it.
+        let fetch = async { self.http.get(format!("{BASE}/{path}")).query(&q).send().await?.error_for_status()?.bytes().await };
+        Ok(fetch.await.map_err(reqwest::Error::without_url)?.to_vec())
     }
 
     /// A cached (1 h) JSON call; `None` when DART has no data.
@@ -371,5 +373,13 @@ mod tests {
             z.finish().unwrap();
         }
         assert_eq!(document_text(buf.get_ref()).unwrap(), "매출액&영업이익");
+    }
+
+    #[tokio::test]
+    async fn transport_errors_do_not_reveal_the_key() {
+        let mut c = DartClient::new("SECRETKEY1234567890".into());
+        c.http = reqwest::Client::builder().timeout(Duration::from_millis(1)).build().unwrap();
+        let e = c.bytes("list.json", &[]).await.unwrap_err();
+        assert!(!format!("{e:#}").contains("SECRETKEY"), "{e:#}");
     }
 }
