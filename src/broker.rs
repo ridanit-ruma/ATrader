@@ -223,7 +223,7 @@ struct Plan {
 
 /// Cash reserved per unit of a resting buy: limit price plus commission.
 fn buy_reserve_per_unit(limit: Decimal, venue: Venue) -> Decimal {
-    limit * (dec!(1) + FeeSchedule::latest(venue).commission_bps / dec!(10000))
+    limit * (dec!(1) + FeeSchedule::reserve_commission_bps(venue) / dec!(10000))
 }
 
 /// Above any real order, far below `Decimal` overflow once multiplied together.

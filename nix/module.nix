@@ -8,15 +8,19 @@ self:
 let
   cfg = config.services.atrader;
   inherit (lib) mkOption types;
-  dbUrl = if cfg.database.createLocally then "postgres://atrader@localhost/atrader?host=/run/postgresql" else cfg.database.url;
-  env = {
-    DATABASE_URL = dbUrl;
+  env = lib.optionalAttrs cfg.database.createLocally {
+    DATABASE_URL = "postgres://atrader@localhost/atrader?host=/run/postgresql";
+  } // {
     ATRADER_HTTP_ADDR = cfg.httpAddress;
     ATRADER_STATE_DIR = "/var/lib/atrader";
   } // cfg.environment;
   # Run the CLI as the service user against the service database, e.g. `atrader-manage user create ruma`.
+  # Run the CLI as the service user against the service database, e.g. `atrader-manage user create ruma`.
+  # A remote DATABASE_URL is read from its credential file here (as root) and handed over through
+  # the environment, never on a command line.
   manage = pkgs.writeShellScriptBin "atrader-manage" ''
-    exec ${pkgs.sudo}/bin/sudo -u atrader ${lib.concatStringsSep " " (lib.mapAttrsToList (k: v: "${k}=${lib.escapeShellArg v}") env)} ${lib.getExe cfg.package} "$@"
+    ${lib.optionalString (cfg.credentials ? DATABASE_URL) ''export DATABASE_URL="$(cat ${lib.escapeShellArg cfg.credentials.DATABASE_URL})"''}
+    exec ${pkgs.sudo}/bin/sudo --preserve-env=DATABASE_URL -u atrader ${lib.concatStringsSep " " (lib.mapAttrsToList (k: v: "${k}=${lib.escapeShellArg v}") env)} ${lib.getExe cfg.package} "$@"
   '';
 in
 {
@@ -61,26 +65,21 @@ in
       createLocally = mkOption {
         type = types.bool;
         default = true;
-        description = "Create a local Postgres database `atrader` owned by the `atrader` user (peer authentication).";
-      };
-      url = mkOption {
-        type = types.str;
-        default = "";
-        description = "Postgres URL when `createLocally` is off. Put a password in a credential file, not here.";
+        description = "Create a local Postgres database `atrader` owned by the `atrader` user (peer authentication). When off, pass the URL as `credentials.DATABASE_URL` so its password stays out of the Nix store.";
       };
     };
     tailscaleServe = mkOption {
       type = types.bool;
       default = false;
-      description = "Publish the dashboard on this machine's tailnet name over HTTPS with `tailscale serve`.";
+      description = "Publish the dashboard on this machine's tailnet name over HTTPS with `tailscale serve`. It owns port 443 of `tailscale serve`: stopping it turns that port's serve config off.";
     };
   };
 
   config = lib.mkIf cfg.enable {
     assertions = [
       {
-        assertion = cfg.database.createLocally || cfg.database.url != "";
-        message = "services.atrader.database.url is required when createLocally is off";
+        assertion = cfg.database.createLocally || cfg.credentials ? DATABASE_URL;
+        message = "services.atrader.credentials.DATABASE_URL is required when database.createLocally is off";
       }
       {
         assertion = !cfg.zyris || cfg.credentials ? ZYRIS_CREDENTIAL;

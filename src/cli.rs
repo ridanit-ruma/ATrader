@@ -130,7 +130,7 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
         .init();
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async move {
-        let url = std::env::var("DATABASE_URL").context("DATABASE_URL is not set")?;
+        let url = crate::secret_env("DATABASE_URL").context("DATABASE_URL (or DATABASE_URL_FILE) is not set")?;
         let store = Arc::new(Store::connect(&url).await?);
         match command {
             Command::AccountCreate { id, name, agent, cash } => {

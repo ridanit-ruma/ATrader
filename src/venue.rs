@@ -172,8 +172,8 @@ fn pick(t: &FeeTable, venue: Venue, now: DateTime<Utc>) -> FeeSchedule {
     v.iter().rev().find(|(from, _)| *from <= day).unwrap_or(&v[0]).1
 }
 
-fn latest(t: &FeeTable, venue: Venue) -> FeeSchedule {
-    t[&venue].last().expect("parse_fees checks every venue").1
+fn max_commission_bps(t: &FeeTable, venue: Venue) -> Decimal {
+    t[&venue].iter().map(|(_, f)| f.commission_bps).max().unwrap_or_default()
 }
 
 impl FeeSchedule {
@@ -182,10 +182,11 @@ impl FeeSchedule {
         pick(&FEES, venue, now)
     }
 
-    /// The newest schedule. Cash reserved for resting buys uses it, so a reservation and its
-    /// release always agree; `restore` recomputes reservations after `fees.toml` changes.
-    pub fn latest(venue: Venue) -> Self {
-        latest(&FEES, venue)
+    /// Commission reserved per unit of a resting buy: the highest rate in `fees.toml`, so it covers
+    /// whichever schedule is in force at fill time and stays constant, keeping every reservation
+    /// and its release equal; `restore` recomputes reservations after `fees.toml` changes.
+    pub fn reserve_commission_bps(venue: Venue) -> Decimal {
+        max_commission_bps(&FEES, venue)
     }
 
     /// (fee, tax) for one execution of `notional`, truncated to `dp` decimal places (brokers drop
@@ -325,7 +326,13 @@ mod tests {
         assert_eq!(pick(&t, Venue::Krx, utc(2025, 12, 31, 14, 0)).sell_tax_bps, dec!(15));
         // KRX dates are Seoul dates: 2025-12-31 15:00 UTC is already 2026-01-01 in Seoul.
         assert_eq!(pick(&t, Venue::Krx, utc(2025, 12, 31, 15, 0)).sell_tax_bps, dec!(20));
-        assert_eq!(latest(&t, Venue::Krx).sell_tax_bps, dec!(20));
+        let cut = parse_fees(
+            "[[KRX]]\nfrom = \"2026-01-01\"\ncommission_bps = 10\n[[KRX]]\nfrom = \"2027-01-01\"\ncommission_bps = 5\n\
+             [[US]]\nfrom = \"2025-01-01\"\n[[UPBIT]]\nfrom = \"2025-01-01\"\n[[BINANCE]]\nfrom = \"2025-01-01\"\n",
+        )
+        .unwrap();
+        // A future commission cut must not shrink what resting buys reserve today.
+        assert_eq!(max_commission_bps(&cut, Venue::Krx), dec!(10));
         assert!(parse_fees("[[KRX]]\nfrom = \"2025-01-01\"\ncommission_bps = 1\n").is_err(), "every venue needs a schedule");
         assert!(parse_fees("[[NASDAQ]]\nfrom = \"2025-01-01\"\n").is_err());
     }
