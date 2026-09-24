@@ -76,13 +76,12 @@ impl App {
     }
 
     pub fn agent_account(&self, id: &str) -> Result<AccountRow, zyris::Error> {
-        self.accounts
-            .read()
-            .unwrap()
-            .get(id)
-            .filter(|r| r.agent_id.is_some())
-            .cloned()
-            .ok_or_else(|| order_error(OrderError::UnknownAccount))
+        self.account(id).filter(|r| r.agent_id.is_some()).ok_or_else(|| order_error(OrderError::UnknownAccount))
+    }
+
+    /// Any account, agent-traded or not.
+    pub fn account(&self, id: &str) -> Option<AccountRow> {
+        self.accounts.read().unwrap().get(id).cloned()
     }
 }
 

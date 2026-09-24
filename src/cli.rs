@@ -41,6 +41,7 @@ ENVIRONMENT:
   ATRADER_STATE_DIR     where the KIS token is cached (default: ~/.local/state/atrader)
   DART_API_KEY          OpenDART key (KRX financials and filings)
   EDGAR_USER_AGENT      name and contact email for SEC EDGAR (US financials and filings)
+  ATRADER_HTTP_ADDR     dashboard listen address (default: 127.0.0.1:8750)
   RUST_LOG              log filter (default: atrader=info,zyris_core=info)";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -242,6 +243,15 @@ async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
     tokio::spawn(crate::alerts::deliver::alert_loop(app.clone(), bus.subscribe(), alert_rx, Arc::new(crate::alerts::deliver::AttaccaNotifier::new(slot.clone()))));
     tokio::spawn(crate::app::snapshot_loop(app.clone()));
 
+    let addr: std::net::SocketAddr = std::env::var("ATRADER_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:8750".into()).parse().context("ATRADER_HTTP_ADDR")?;
+    let web = crate::web::WebState::new(app.clone(), crate::web::auth::AuthStore(app.store.pool().clone()), true).with_bus(bus.clone());
+    let zyris_connected = web.zyris_connected.clone();
+    tokio::spawn(async move {
+        if let Err(e) = crate::web::serve_http(web, addr).await {
+            tracing::error!(error = %e, "dashboard stopped");
+        }
+    });
+
     let timers = app.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -267,6 +277,8 @@ async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
             let slot = slot.clone();
             move |conn| {
                 let slot = slot.clone();
+                // ponytail: set once and never cleared; clear it on disconnect if the SDK grows a hook.
+                zyris_connected.store(true, std::sync::atomic::Ordering::Relaxed);
                 async move { slot.put(conn) }
             }
         })

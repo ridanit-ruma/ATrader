@@ -7,6 +7,7 @@ edition = "2024"
 anyhow = "1.0.104"
 argon2 = "0.5"
 async-trait = "0.1.92"
+axum = "0.8"
 chrono = { version = "0.4.45", features = ["serde"] }
 chrono-tz = "0.10.4"
 encoding_rs = "0.8.41"
@@ -14,6 +15,7 @@ futures-util = "0.3.34"
 rand = "0.8"
 reqwest = { version = "0.13.5", default-features = false, features = ["gzip", "json", "query", "rustls-no-provider"] }
 rpassword = "7.5.4"
+rust-embed = { version = "8", features = ["include-exclude"] }
 rust_decimal = { version = "1.43.0", features = ["serde-with-arbitrary-precision"] }
 rust_decimal_macros = "1.40.0"
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
@@ -23,7 +25,7 @@ serde_json = { version = "1.0.151", features = ["arbitrary_precision"] }
 sha2 = "0.11.0"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres", "macros", "migrate", "rust_decimal", "chrono"] }
 thiserror = "2.0.21"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
 toml = "1.1.6"
 totp-rs = { version = "5", features = ["otpauth", "gen_secret"] }
@@ -36,3 +38,4 @@ zyris-attacca = { git = "https://github.com/attacca-cc/zyris-protocol", rev = "4
 [dev-dependencies]
 tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["test-util", "rt-multi-thread", "macros", "sync", "time"] }
+tower = { version = "0.5", features = ["util"] }

@@ -1,3 +1,8 @@
+mod common;
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode, header};
+use tower::ServiceExt;
 use atrader::web::auth::*;
 use chrono::{Duration, Utc};
 use sqlx::PgPool;
@@ -41,4 +46,136 @@ async fn totp_codes_are_single_use_and_resets_end_sessions(pool: PgPool) {
     s.create_session(uid, &token_hash(&tok), false, "ip", "ua", now).await.unwrap();
     s.delete_user_sessions(uid).await.unwrap();
     assert!(s.session(&token_hash(&tok), now).await.unwrap().is_none());
+}
+
+async fn web(pool: PgPool) -> (axum::Router, AuthStore, String) {
+    let (app, _t) = common::rig(pool.clone()).await;
+    let auth = AuthStore(pool);
+    let secret = new_totp_secret();
+    let uid = auth.create_user("ruma", &hash_password("long enough pass")).await.unwrap();
+    auth.set_totp(uid, Some(&secret), true).await.unwrap();
+    let state = atrader::web::WebState::new(app, auth_clone(&auth), false);
+    (atrader::web::router(state), auth, secret)
+}
+
+fn auth_clone(a: &AuthStore) -> AuthStore {
+    AuthStore(a.0.clone())
+}
+
+fn req(method: &str, uri: &str, cookie: Option<&str>, body: Option<serde_json::Value>) -> Request<Body> {
+    let mut r = Request::builder().method(method).uri(uri).header("x-forwarded-for", "10.0.0.1");
+    if method != "GET" {
+        r = r.header("x-requested-with", "atrader");
+    }
+    if let Some(c) = cookie {
+        r = r.header(header::COOKIE, format!("atrader_session={c}"));
+    }
+    match body {
+        Some(b) => r.header(header::CONTENT_TYPE, "application/json").body(Body::from(b.to_string())).unwrap(),
+        None => r.body(Body::empty()).unwrap(),
+    }
+}
+
+async fn login(router: &axum::Router, secret: &str) -> String {
+    let code = atrader::web::auth::current_code_for_tests(secret, Utc::now());
+    let res = router.clone().oneshot(req("POST", "/api/auth/login", None, Some(serde_json::json!({"username": "ruma", "password": "long enough pass", "code": code})))).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let set = res.headers()[header::SET_COOKIE].to_str().unwrap().to_string();
+    assert!(set.contains("HttpOnly") && set.contains("SameSite=Strict") && set.contains("Path=/"), "{set}");
+    set.split(';').next().unwrap().trim_start_matches("atrader_session=").to_string()
+}
+
+#[sqlx::test]
+async fn api_requires_a_full_login(pool: PgPool) {
+    let (r, _, secret) = web(pool).await;
+    assert_eq!(r.clone().oneshot(req("GET", "/api/overview", None, None)).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    let c = login(&r, &secret).await;
+    let res = r.clone().oneshot(req("GET", "/api/overview", Some(&c), None)).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()["x-frame-options"], "DENY");
+    assert!(res.headers()["content-security-policy"].to_str().unwrap().contains("default-src 'self'"));
+    // CSRF header required on mutations.
+    let mut no_csrf = req("POST", "/api/auth/logout", Some(&c), None);
+    no_csrf.headers_mut().remove("x-requested-with");
+    assert_eq!(r.clone().oneshot(no_csrf).await.unwrap().status(), StatusCode::FORBIDDEN);
+    assert_eq!(r.clone().oneshot(req("POST", "/api/auth/logout", Some(&c), None)).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(r.clone().oneshot(req("GET", "/api/overview", Some(&c), None)).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test]
+async fn wrong_factors_are_indistinguishable_and_lock_out(pool: PgPool) {
+    let (r, _, secret) = web(pool).await;
+    let attempt = |pw: &str, code: &str| req("POST", "/api/auth/login", None, Some(serde_json::json!({"username": "ruma", "password": pw, "code": code})));
+    let good_code = atrader::web::auth::current_code_for_tests(&secret, Utc::now());
+    let a = r.clone().oneshot(attempt("wrong password!!", &good_code)).await.unwrap();
+    let b = r.clone().oneshot(attempt("long enough pass", "000000")).await.unwrap();
+    assert_eq!((a.status(), b.status()), (StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED));
+    let body = |res: axum::response::Response| async { axum::body::to_bytes(res.into_body(), 10_000).await.unwrap() };
+    assert_eq!(body(a).await, body(b).await);
+    for _ in 0..3 {
+        r.clone().oneshot(attempt("nope nope nope", "000000")).await.unwrap();
+    }
+    assert_eq!(r.clone().oneshot(attempt("long enough pass", &good_code)).await.unwrap().status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[sqlx::test]
+async fn pending_totp_sessions_can_only_enrol(pool: PgPool) {
+    let (app, _t) = common::rig(pool.clone()).await;
+    let auth = AuthStore(pool.clone());
+    auth.create_user("new", &hash_password("long enough pass")).await.unwrap();
+    let r = atrader::web::router(atrader::web::WebState::new(app, AuthStore(pool), false));
+    let res = r.clone().oneshot(req("POST", "/api/auth/login", None, Some(serde_json::json!({"username": "new", "password": "long enough pass"})))).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let c = res.headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().trim_start_matches("atrader_session=").to_string();
+    assert_eq!(r.clone().oneshot(req("GET", "/api/overview", Some(&c), None)).await.unwrap().status(), StatusCode::FORBIDDEN);
+    let setup = r.clone().oneshot(req("POST", "/api/auth/totp/setup", Some(&c), None)).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(setup.into_body(), 10_000).await.unwrap()).unwrap();
+    let code = atrader::web::auth::current_code_for_tests(v["secret"].as_str().unwrap(), Utc::now());
+    let en = r.clone().oneshot(req("POST", "/api/auth/totp/enable", Some(&c), Some(serde_json::json!({"code": code})))).await.unwrap();
+    let full = cookie_of(&en);
+    let v: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(en.into_body(), 10_000).await.unwrap()).unwrap();
+    assert_eq!(v["recovery_codes"].as_array().unwrap().len(), 10);
+    // Enrolment rotates the session: the pre-2FA token is dead, the new one is a full session.
+    assert_eq!(r.clone().oneshot(req("GET", "/api/overview", Some(&c), None)).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(r.clone().oneshot(req("GET", "/api/overview", Some(&full), None)).await.unwrap().status(), StatusCode::OK);
+}
+
+fn cookie_of(res: &axum::response::Response) -> String {
+    res.headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().trim_start_matches("atrader_session=").to_string()
+}
+
+#[sqlx::test]
+async fn password_change_ends_every_other_session(pool: PgPool) {
+    let (r, _, secret) = web(pool).await;
+    let a = login(&r, &secret).await;
+    let short = r.clone().oneshot(req("POST", "/api/auth/password", Some(&a), Some(serde_json::json!({"current": "long enough pass", "new": "short"})))).await.unwrap();
+    assert_eq!(short.status(), StatusCode::BAD_REQUEST);
+    let wrong = r.clone().oneshot(req("POST", "/api/auth/password", Some(&a), Some(serde_json::json!({"current": "not the password", "new": "another long pass"})))).await.unwrap();
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+    let ok = r.clone().oneshot(req("POST", "/api/auth/password", Some(&a), Some(serde_json::json!({"current": "long enough pass", "new": "another long pass"})))).await.unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+    let b = cookie_of(&ok);
+    assert_eq!(r.clone().oneshot(req("GET", "/api/overview", Some(&a), None)).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(r.clone().oneshot(req("GET", "/api/overview", Some(&b), None)).await.unwrap().status(), StatusCode::OK);
+}
+
+#[sqlx::test]
+async fn accounts_are_managed_over_http(pool: PgPool) {
+    let (r, _, secret) = web(pool).await;
+    let c = login(&r, &secret).await;
+    let bad = r.clone().oneshot(req("POST", "/api/accounts", Some(&c), Some(serde_json::json!({"id": "Bad Id!", "name": "x", "cash": {"KRW": "1"}})))).await.unwrap();
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+    let neg = r.clone().oneshot(req("POST", "/api/accounts", Some(&c), Some(serde_json::json!({"id": "neg", "name": "x", "cash": {"KRW": "-1"}})))).await.unwrap();
+    assert_eq!(neg.status(), StatusCode::BAD_REQUEST);
+    let ok = r.clone().oneshot(req("POST", "/api/accounts", Some(&c), Some(serde_json::json!({"id": "swing", "name": "Swing", "agent_id": "ag", "cash": {"KRW": "5000000"}})))).await.unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+    assert_eq!(r.clone().oneshot(req("GET", "/api/accounts/swing", Some(&c), None)).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(r.clone().oneshot(req("GET", "/api/accounts/missing", Some(&c), None)).await.unwrap().status(), StatusCode::NOT_FOUND);
+    let reset = r.clone().oneshot(req("POST", "/api/accounts/swing/reset", Some(&c), Some(serde_json::json!({"cash": {"KRW": "1000"}})))).await.unwrap();
+    assert_eq!(reset.status(), StatusCode::OK);
+    let chart = r.clone().oneshot(req("GET", "/api/instruments/UPBIT:KRW-BTC/chart?interval=1d&limit=10&account=bot", Some(&c), None)).await.unwrap();
+    assert_eq!(chart.status(), StatusCode::OK);
+    let audit = r.clone().oneshot(req("GET", "/api/audit", Some(&c), None)).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(audit.into_body(), 100_000).await.unwrap()).unwrap();
+    assert!(v.as_array().unwrap().iter().any(|e| e["action"] == "account_reset"));
 }
