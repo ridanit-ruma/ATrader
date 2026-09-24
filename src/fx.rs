@@ -29,7 +29,7 @@ pub struct FxCache {
 impl FxCache {
     pub fn new() -> Self {
         crate::init_tls();
-        FxCache { http: reqwest::Client::new(), cached: Mutex::new(None), fixed: false }
+        FxCache { http: reqwest::Client::builder().timeout(Duration::from_secs(10)).build().expect("http client"), cached: Mutex::new(None), fixed: false }
     }
 
     /// A cache that always answers `rate` (tests, and offline runs).

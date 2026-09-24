@@ -441,3 +441,29 @@ async fn alert_tools_validate_and_scope_to_the_account(pool: PgPool) {
     assert!(!gone.active);
     assert_eq!(t.list_alerts("bot".into()).await.unwrap().len(), 1);
 }
+
+#[sqlx::test]
+async fn simultaneous_alerts_share_one_new_session(pool: PgPool) {
+    use atrader::alerts::{Alert, Condition, deliver::{AlertCmd, alert_loop}};
+    let (app, _t) = rig(pool).await;
+    let (bus, _) = broadcast::channel(64);
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let rec = Arc::new(Recorder { sent: Default::default(), fail: Default::default() });
+    tokio::spawn(alert_loop(app.clone(), bus.subscribe(), cmd_rx, rec.clone(), std::collections::HashMap::from([("bot".to_string(), 1)])));
+    for price in [dec!(99000000), dec!(99500000)] {
+        let a = Alert { id: 0, account: "bot".into(), generation: 1, condition: Condition::PriceAbove { id: "UPBIT:KRW-BTC".parse().unwrap(), price }, note: "n".into(), once: true, created_at: Utc::now(), last_fired_at: None };
+        let id = app.store.create_alert(&a).await.unwrap();
+        cmd_tx.send(AlertCmd::Upsert(Alert { id, ..a })).unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    bus.send(atrader::market::BusEvent::Market(MarketEvent::Trade(Trade { instrument: "UPBIT:KRW-BTC".parse().unwrap(), price: dec!(100000000), qty: dec!(1), at: Utc::now() }))).unwrap();
+    for _ in 0..100 {
+        if rec.sent.lock().unwrap().len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let sent = rec.sent.lock().unwrap().clone();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent.iter().filter(|s| s.2.is_none()).count(), 1, "both deliveries created a session: {sent:?}");
+}

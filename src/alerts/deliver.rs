@@ -137,6 +137,7 @@ pub async fn alert_loop(
     app.market.set_extra_pins(watcher.instruments());
     let mut limiter = Limiter::default();
     let mut digest: HashMap<String, VecDeque<(i64, String)>> = HashMap::new();
+    let mut locks: HashMap<String, Arc<tokio::sync::Mutex<()>>> = HashMap::new();
     let mut tick = tokio::time::interval(StdDuration::from_secs(30));
     loop {
         let firings: Vec<Firing> = tokio::select! {
@@ -183,32 +184,46 @@ pub async fn alert_loop(
             app.market.set_extra_pins(watcher.instruments());
         }
         for f in firings {
-            if f.alert_id > 0 {
-                if let Err(e) = app.store.mark_fired(f.alert_id, Utc::now(), f.deactivate).await {
-                    tracing::error!(error = %e, alert = f.alert_id, "could not mark alert fired");
-                }
-            }
-            let note = if f.note.is_empty() { String::new() } else { format!(" Your note: \"{}\".", f.note) };
             let is_digest = f.alert_id < 0;
             if !is_digest && !limiter.admit(&f.account, Utc::now()) {
                 digest.entry(f.account.clone()).or_default().push_back((f.alert_id, f.text));
                 continue;
             }
-            let head = if is_digest { "ATrader alert digest".to_string() } else { format!("ATrader alert #{}", f.alert_id) };
-            let text = format!(
-                "{head} on account {}: {}.{note}{} Use the trader tools on node {{node}} to act; give a reason for any order.",
-                f.account,
-                f.text,
-                account_line(&app, &f.account).await
-            );
-            // The digest's alert id is not a row; record it against the first queued alert instead.
-            let event_alert = if is_digest { 0 } else { f.alert_id };
-            if event_alert > 0 {
-                tokio::spawn(deliver(app.clone(), notifier.clone(), f.account.clone(), event_alert, text));
-            } else {
-                tokio::spawn(deliver_untracked(app.clone(), notifier.clone(), f.account.clone(), text));
+            // Everything that waits (DB, FX, Attacca) happens off the evaluation loop.
+            let lock = locks.entry(f.account.clone()).or_default().clone();
+            tokio::spawn(handle(app.clone(), notifier.clone(), lock, f));
+        }
+    }
+}
+
+/// Persist a firing, compose its message and deliver it. Per-account `lock` serializes delivery
+/// so simultaneous firings share one Attacca session.
+async fn handle(app: Arc<App>, notifier: Arc<dyn Notifier>, lock: Arc<tokio::sync::Mutex<()>>, f: Firing) {
+    if f.alert_id > 0 {
+        // A lost deactivation would re-arm a one-shot alert after a restart: retry.
+        for attempt in 1..=5u32 {
+            match app.store.mark_fired(f.alert_id, Utc::now(), f.deactivate).await {
+                Ok(()) => break,
+                Err(e) => {
+                    tracing::error!(error = %e, alert = f.alert_id, attempt, "could not mark alert fired");
+                    tokio::time::sleep(StdDuration::from_secs(u64::from(attempt))).await;
+                }
             }
         }
+    }
+    let _serial = lock.lock().await;
+    let note = if f.note.is_empty() { String::new() } else { format!(" Your note: \"{}\".", f.note) };
+    let head = if f.alert_id < 0 { "ATrader alert digest".to_string() } else { format!("ATrader alert #{}", f.alert_id) };
+    let text = format!(
+        "{head} on account {}: {}.{note}{} Use the trader tools on node {{node}} to act; give a reason for any order.",
+        f.account,
+        f.text,
+        account_line(&app, &f.account).await
+    );
+    if f.alert_id > 0 {
+        deliver(app, notifier, f.account, f.alert_id, text).await;
+    } else {
+        deliver_untracked(app, notifier, f.account, text).await;
     }
 }
 
