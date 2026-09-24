@@ -2,6 +2,7 @@
 //! `run_feed` keeps alive across disconnects.
 
 pub mod binance;
+pub mod kis;
 pub mod upbit;
 
 use std::sync::Arc;
