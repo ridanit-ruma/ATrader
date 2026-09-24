@@ -84,6 +84,8 @@ pub fn new_recovery_codes() -> Vec<String> {
 #[derive(Debug, Default)]
 pub struct Limiter {
     failures: HashMap<String, (Vec<DateTime<Utc>>, Option<DateTime<Utc>>)>,
+    /// Map size that triggers the next sweep of stale keys; doubles so sweeps stay amortised O(1).
+    sweep_at: usize,
 }
 
 impl Limiter {
@@ -95,6 +97,12 @@ impl Limiter {
     }
 
     pub fn fail(&mut self, key: &str, now: DateTime<Utc>) {
+        // Keys come from client input; forget the ones whose window and lockout have both passed
+        // so a stream of made-up usernames cannot grow the map without bound.
+        if self.failures.len() >= self.sweep_at.max(1000) {
+            self.failures.retain(|_, (times, until)| until.is_some_and(|u| u > now) || times.iter().any(|t| now - *t < Duration::minutes(15)));
+            self.sweep_at = self.failures.len() * 2;
+        }
         let (times, until) = self.failures.entry(key.to_string()).or_default();
         times.retain(|t| now - *t < Duration::minutes(15));
         times.push(now);
@@ -106,6 +114,14 @@ impl Limiter {
 
     pub fn succeed(&mut self, key: &str) {
         self.failures.remove(key);
+    }
+
+    pub fn len(&self) -> usize {
+        self.failures.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.failures.is_empty()
     }
 }
 
@@ -295,5 +311,19 @@ mod tests {
         l.succeed("u:ruma");
         assert!(l.check("u:ruma", t + chrono::Duration::seconds(62)).is_ok());
         assert!(l.check("ip:1.2.3.4", t).is_ok());
+    }
+
+    #[test]
+    fn limiter_forgets_stale_keys() {
+        let mut l = Limiter::default();
+        let t = Utc.with_ymd_and_hms(2026, 9, 25, 0, 0, 0).unwrap();
+        for i in 0..5000 {
+            l.fail(&format!("u:guess{i}"), t);
+        }
+        // Once their window has passed, the old keys are swept as new ones arrive.
+        for i in 0..5000 {
+            l.fail(&format!("u:later{i}"), t + chrono::Duration::minutes(16));
+        }
+        assert!(l.len() <= 5000, "{}", l.len());
     }
 }

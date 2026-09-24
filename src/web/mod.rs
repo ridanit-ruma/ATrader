@@ -184,7 +184,8 @@ static DUMMY_HASH: LazyLock<String> = LazyLock::new(|| auth::hash_password("not 
 
 async fn login(State(s): State<WebState>, peer: Peer, headers: HeaderMap, Json(b): Json<LoginBody>) -> Result<Response, ApiError> {
     let ip = peer_ip(&headers, peer);
-    let (ukey, ikey) = (format!("u:{}", b.username), format!("ip:{ip}"));
+    let name: String = b.username.chars().take(64).collect();
+    let (ukey, ikey) = (format!("u:{name}"), format!("ip:{ip}"));
     let now = Utc::now();
     {
         let l = s.limiter.lock().unwrap();
@@ -212,7 +213,7 @@ async fn login(State(s): State<WebState>, peer: Peer, headers: HeaderMap, Json(b
             l.fail(&ukey, now);
             l.fail(&ikey, now);
         }
-        let _ = s.auth.audit(None, "login_failed", &b.username, &ip).await;
+        let _ = s.auth.audit(None, "login_failed", &name, &ip).await;
         return Err(ApiError(StatusCode::UNAUTHORIZED, "login_failed", "wrong username, password or code".into()));
     };
     {
@@ -229,7 +230,8 @@ async fn logout(State(s): State<WebState>, peer: Peer, headers: HeaderMap) -> Re
     let (user, session) = authed(&s, &headers, true).await?;
     s.auth.delete_session(user.id, &session.id_hash).await.map_err(internal)?;
     let _ = s.auth.audit(Some(user.id), "logout", "", &peer_ip(&headers, peer)).await;
-    Ok(with_cookie(format!("{COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"), json!({})))
+    let secure = if s.cookie_secure { "; Secure" } else { "" };
+    Ok(with_cookie(format!("{COOKIE}=; HttpOnly{secure}; SameSite=Strict; Path=/; Max-Age=0"), json!({})))
 }
 
 async fn me(State(s): State<WebState>, headers: HeaderMap) -> ApiResult {
