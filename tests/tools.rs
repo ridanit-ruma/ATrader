@@ -308,3 +308,100 @@ async fn fundamentals_need_their_keys(pool: PgPool) {
     assert_eq!(code(&t.list_filings("UPBIT:KRW-BTC".into(), None, None).await.unwrap_err()), "INVALID_REQUEST");
     assert_eq!(code(&t.list_filings("UPBIT:KRW-BTC".into(), Some("yesterday".into()), None).await.unwrap_err()), "InvalidParams");
 }
+
+struct Recorder {
+    sent: std::sync::Mutex<Vec<(String, String, Option<String>, String)>>,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl atrader::alerts::deliver::Notifier for Recorder {
+    async fn send(&self, agent_id: &str, account: &str, session: Option<String>, text: &str) -> anyhow::Result<String> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("attacca unreachable");
+        }
+        self.sent.lock().unwrap().push((agent_id.into(), account.into(), session, text.into()));
+        Ok("sess-1".into())
+    }
+}
+
+#[sqlx::test]
+async fn fired_alerts_reach_the_agent_once(pool: PgPool) {
+    use atrader::alerts::{Alert, Condition, deliver::{AlertCmd, alert_loop}};
+    let (app, _t) = rig(pool).await;
+    let (bus, _) = broadcast::channel(64);
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let rec = Arc::new(Recorder { sent: Default::default(), fail: Default::default() });
+    let gens = std::collections::HashMap::from([("bot".to_string(), 1)]);
+    tokio::spawn(alert_loop(app.clone(), bus.subscribe(), cmd_rx, rec.clone(), gens));
+    let alert = Alert {
+        id: 0,
+        account: "bot".into(),
+        generation: 1,
+        condition: Condition::PriceAbove { id: "UPBIT:KRW-BTC".parse().unwrap(), price: dec!(100000000) },
+        note: "breakout".into(),
+        once: true,
+        created_at: Utc::now(),
+        last_fired_at: None,
+    };
+    let id = app.store.create_alert(&alert).await.unwrap();
+    cmd_tx.send(AlertCmd::Upsert(Alert { id, ..alert })).unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let print = |p| atrader::market::BusEvent::Market(MarketEvent::Trade(Trade { instrument: "UPBIT:KRW-BTC".parse().unwrap(), price: p, qty: dec!(1), at: Utc::now() }));
+    bus.send(print(dec!(100000000))).unwrap();
+    bus.send(print(dec!(100100000))).unwrap();
+    for _ in 0..100 {
+        if !rec.sent.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let sent = rec.sent.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    let (agent, account, session, text) = &sent[0];
+    assert_eq!((agent.as_str(), account.as_str(), session.as_deref()), ("agent-1", "bot", None));
+    assert!(text.contains("breakout") && text.contains("#") && text.contains("equity"), "{text}");
+    assert!(app.store.active_alerts("bot", 1).await.unwrap().is_empty()); // one-shot persisted as off
+    assert_eq!(app.store.alert_session("bot").await.unwrap().as_deref(), Some("sess-1"));
+}
+
+#[sqlx::test]
+async fn failed_deliveries_are_recorded(pool: PgPool) {
+    use atrader::alerts::{Alert, Condition, deliver::{AlertCmd, alert_loop}};
+    let (app, _t) = rig(pool.clone()).await;
+    let (bus, _) = broadcast::channel(64);
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let rec = Arc::new(Recorder { sent: Default::default(), fail: std::sync::atomic::AtomicBool::new(true) });
+    tokio::spawn(alert_loop(app.clone(), bus.subscribe(), cmd_rx, rec, std::collections::HashMap::from([("bot".to_string(), 1)])));
+    let alert = Alert { id: 0, account: "bot".into(), generation: 1, condition: Condition::OrderFilled { id: None }, note: "fills".into(), once: false, created_at: Utc::now(), last_fired_at: None };
+    let id = app.store.create_alert(&alert).await.unwrap();
+    cmd_tx.send(AlertCmd::Upsert(Alert { id, ..alert })).unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let fill = atrader::broker::Fill {
+        order_id: 1,
+        account: "bot".into(),
+        instrument: "UPBIT:KRW-BTC".parse().unwrap(),
+        side: Side::Buy,
+        qty: dec!(0.1),
+        notional: dec!(10000000),
+        price: dec!(100000000),
+        fee: dec!(5000),
+        tax: dec!(0),
+        realized_pnl: None,
+        liquidity: atrader::broker::Liquidity::Taker,
+        at: Utc::now(),
+    };
+    bus.send(atrader::market::BusEvent::Fill(fill)).unwrap();
+    let mut row = None;
+    for _ in 0..100 {
+        row = sqlx::query_as::<_, (bool, Option<String>)>("SELECT delivered, error FROM alert_events").fetch_optional(&pool).await.unwrap();
+        if row.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let (delivered, error) = row.expect("an event row");
+    assert!(!delivered);
+    assert!(error.unwrap().contains("unreachable"));
+}

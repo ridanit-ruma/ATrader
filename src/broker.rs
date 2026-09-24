@@ -536,6 +536,14 @@ impl SimBroker {
         ids
     }
 
+    pub fn stats(&self, id: &InstrumentId) -> Option<DailyStats> {
+        self.world.lock().unwrap().stats.get(id).copied()
+    }
+
+    pub fn calendar(&self) -> Calendar {
+        self.calendar.clone()
+    }
+
     pub fn has_stats(&self, id: &InstrumentId) -> bool {
         self.world.lock().unwrap().stats.contains_key(id)
     }

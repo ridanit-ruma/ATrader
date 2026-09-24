@@ -109,6 +109,7 @@ dependencies = [
  "tracing-subscriber",
  "zip",
  "zyris",
+ "zyris-attacca",
 ]
 
 [[package]]
@@ -3121,6 +3122,17 @@ name = "zyris"
 version = "0.2.0"
 source = "git+https://github.com/attacca-cc/zyris-protocol?rev=4614f0ea16f646408df590c0b249bd34c7a05d69#4614f0ea16f646408df590c0b249bd34c7a05d69"
 dependencies = [
+ "zyris-core",
+]
+
+[[package]]
+name = "zyris-attacca"
+version = "0.2.0"
+source = "git+https://github.com/attacca-cc/zyris-protocol?rev=4614f0ea16f646408df590c0b249bd34c7a05d69#4614f0ea16f646408df590c0b249bd34c7a05d69"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
  "zyris-core",
 ]
 

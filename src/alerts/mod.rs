@@ -1,5 +1,7 @@
 //! Agent-defined alerts: conditions, a pure evaluator, and delivery to Attacca.
 
+pub mod deliver;
+
 use std::collections::{HashMap, VecDeque};
 
 use chrono::{DateTime, Duration, Utc};

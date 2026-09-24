@@ -46,11 +46,12 @@ struct VenueFeed {
 pub struct Market {
     broker: Arc<SimBroker>,
     venues: HashMap<Venue, VenueFeed>,
+    extra: std::sync::Mutex<Vec<InstrumentId>>,
 }
 
 impl Market {
     pub fn new(broker: Arc<SimBroker>) -> Self {
-        Market { broker, venues: HashMap::new() }
+        Market { broker, venues: HashMap::new(), extra: std::sync::Mutex::new(Vec::new()) }
     }
 
     /// Register a feed. Hand the returned receiver to `feed::run_feed`.
@@ -107,10 +108,17 @@ impl Market {
         Ok(())
     }
 
+    /// Instruments that must stay subscribed besides open exposure (alerts watch them).
+    pub fn set_extra_pins(&self, ids: Vec<InstrumentId>) {
+        *self.extra.lock().unwrap() = ids;
+        self.refresh_pins();
+    }
+
     /// Pin every instrument with a position or resting order to its venue's subscription set.
     /// Call after fills and on a timer.
     pub fn refresh_pins(&self) {
-        let active = self.broker.active_instruments();
+        let mut active = self.broker.active_instruments();
+        active.extend(self.extra.lock().unwrap().iter().cloned());
         for (venue, vf) in &self.venues {
             vf.subs.pin(active.iter().filter(|i| i.venue == *venue).cloned().collect());
         }
