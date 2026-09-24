@@ -1,6 +1,7 @@
 //! Korea Investment & Securities (KIS) Open API: KRX and US stock market data.
 
 pub mod master;
+pub mod ws;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration as StdDuration, Instant};
