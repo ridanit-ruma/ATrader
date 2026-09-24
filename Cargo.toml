@@ -10,7 +10,7 @@ chrono = { version = "0.4.45", features = ["serde"] }
 chrono-tz = "0.10.4"
 encoding_rs = "0.8.41"
 futures-util = "0.3.34"
-reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "query", "rustls-no-provider"] }
 rust_decimal = { version = "1.43.0", features = ["serde-with-arbitrary-precision"] }
 rust_decimal_macros = "1.40.0"
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
