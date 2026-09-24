@@ -161,3 +161,55 @@ fn every_order_error_maps_to_a_code() {
     }
     let _ = Duration::ZERO;
 }
+
+#[sqlx::test]
+async fn place_then_read_history_and_account(pool: PgPool) {
+    let (app, t) = rig(pool).await;
+    assert_eq!(t.list_accounts().await.unwrap().iter().map(|a| a.id.clone()).collect::<Vec<_>>(), vec!["bot"]);
+    let est = t.estimate_order(buy("bot", Some(dec!(0.1)), "sizing")).await.unwrap();
+    assert_eq!(est.filled_qty, dec!(0.1));
+    let placed = t.place_order(buy("bot", Some(dec!(0.1)), "momentum entry")).await.unwrap();
+    assert_eq!(placed.order.status, "filled");
+    assert_eq!(placed.fills.len(), 1);
+
+    let mut fills = Vec::new();
+    for _ in 0..100 {
+        fills = t.list_fills("bot".into(), None, None).await.unwrap();
+        if !fills.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(fills.len(), 1);
+    let orders = t.list_orders("bot".into(), None, None).await.unwrap();
+    assert_eq!(orders[0].reason, "momentum entry");
+
+    let acct = t.get_account("bot".into()).await.unwrap();
+    assert!(acct.equity_krw < dec!(1000000000) && acct.equity_krw > dec!(999900000), "equity {}", acct.equity_krw);
+    let pos = t.get_positions("bot".into()).await.unwrap();
+    assert_eq!(pos[0].qty, dec!(0.1));
+    assert!(pos[0].weight_pct > dec!(0) && pos[0].weight_pct < dec!(2));
+
+    let c = t.convert_currency("bot".into(), "krw".into(), "USD".into(), dec!(1400000)).await.unwrap();
+    assert_eq!(c.credit, dec!(999));
+    let acct = t.get_account("bot".into()).await.unwrap();
+    assert!(acct.cash.iter().any(|c| c.currency == "USD" && c.balance == dec!(999)));
+    assert_eq!(code(&t.convert_currency("bot".into(), "KRW".into(), "EUR".into(), dec!(1)).await.unwrap_err()), "InvalidParams");
+    let _ = app;
+}
+
+#[sqlx::test]
+async fn resting_orders_can_be_listed_and_cancelled(pool: PgPool) {
+    let (_, t) = rig(pool).await;
+    let mut o = buy("bot", Some(dec!(0.1)), "bid below market");
+    o.kind = KindDto::Limit;
+    o.limit_price = Some(dec!(99000000));
+    let placed = t.place_order(o).await.unwrap();
+    assert_eq!((placed.order.status.as_str(), placed.order.tif), ("open", TifDto::Gtc));
+    let cancelled = t.cancel_order("bot".into(), placed.order.id).await.unwrap();
+    assert_eq!(cancelled.status, "cancelled");
+    assert_eq!(code(&t.cancel_order("bot".into(), 999).await.unwrap_err()), "NOT_FOUND");
+    assert_eq!(code(&t.cancel_order("manual".into(), placed.order.id).await.unwrap_err()), "UNKNOWN_ACCOUNT");
+    assert_eq!(code(&t.get_account("manual".into()).await.unwrap_err()), "UNKNOWN_ACCOUNT");
+    assert_eq!(code(&t.list_orders("manual".into(), None, None).await.unwrap_err()), "UNKNOWN_ACCOUNT");
+}

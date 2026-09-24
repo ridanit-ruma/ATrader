@@ -11,9 +11,10 @@ use zyris::{ErrorCode, Payload};
 
 pub use dto::*;
 
-use crate::app::App;
-use crate::broker::OrderError;
+use crate::app::{App, krw_per};
+use crate::broker::{OrderError, OrderRequest, OrderType, Tif};
 use crate::domain::{Currency, InstrumentId, Level, Venue};
+use crate::sim::Size;
 
 const STALE_AFTER_SECS: i64 = 5;
 const MAX_QUOTES: usize = 20;
@@ -142,7 +143,88 @@ fn clamp_limit(limit: Option<u32>) -> i64 {
     i64::from(limit.unwrap_or(50).clamp(1, 200))
 }
 
+fn to_request(o: &OrderInput) -> Result<OrderRequest, zyris::Error> {
+    let instrument = parse_id(&o.instrument)?;
+    let size = match (o.qty, o.notional) {
+        (Some(q), None) => Size::Qty(q),
+        (None, Some(n)) => Size::Notional(n),
+        _ => return Err(bad("give exactly one of qty or notional")),
+    };
+    if o.reason.trim().is_empty() {
+        return Err(bad("reason is required: say why you are placing this order"));
+    }
+    let kind: OrderType = o.kind.into();
+    let tif = match (o.tif, kind) {
+        (_, OrderType::Market) => Tif::Ioc,
+        (Some(t), OrderType::Limit) => t.into(),
+        (None, OrderType::Limit) if instrument.venue.has_session() => Tif::Day,
+        (None, OrderType::Limit) => Tif::Gtc,
+    };
+    Ok(OrderRequest { instrument, side: o.side.into(), kind, size, limit_price: o.limit_price, tif, reason: o.reason.trim().to_string() })
+}
+
 impl TraderTools {
+    async fn valuation(&self, account: &str) -> zyris::Result<(AccountSummary, Vec<PositionView>)> {
+        let row = self.app.agent_account(account)?;
+        let pf = self.app.broker.portfolio(&row.id).ok_or_else(|| order_error(OrderError::UnknownAccount))?;
+        let usd_krw = self.app.fx.usd_krw().await.map_err(|e| upstream(format!("{e:#}")))?;
+        let mut rows = Vec::new();
+        for (id, p) in &pf.positions {
+            if p.qty.is_zero() {
+                continue;
+            }
+            if let Err(e) = self.app.market.ensure_fresh(id).await {
+                tracing::debug!(instrument = %id, error = %e, "valuing without fresh data");
+            }
+            let price = self.app.broker.book_view(id, 1).and_then(|v| mid(&v.shadow_bids, &v.shadow_asks));
+            let cur = id.venue.currency();
+            let value = (p.qty * price.unwrap_or(p.avg_cost)).round_dp(cur.decimals());
+            let cost = p.qty * p.avg_cost;
+            let pct = if cost.is_zero() { Decimal::ZERO } else { ((value - cost) / cost * Decimal::ONE_HUNDRED).round_dp(2) };
+            let view = PositionView {
+                instrument: id.to_string(),
+                name: self.app.broker.instrument(id).map(|i| i.name).unwrap_or_default(),
+                currency: cur.code().into(),
+                qty: p.qty,
+                avg_cost: p.avg_cost.round_dp(8),
+                price,
+                market_value: value,
+                unrealized_pnl: (value - cost).round_dp(cur.decimals()),
+                unrealized_pct: pct,
+                weight_pct: Decimal::ZERO,
+            };
+            rows.push((view, value * krw_per(cur, usd_krw)));
+        }
+        let mut cash = Vec::new();
+        let mut cash_krw = Decimal::ZERO;
+        for c in [Currency::Krw, Currency::Usd, Currency::Usdt] {
+            if let Some(balance) = pf.cash.get(&c).copied() {
+                cash.push(CashView { currency: c.code().into(), balance, available: pf.available_cash(c) });
+                cash_krw += balance * krw_per(c, usd_krw);
+            }
+        }
+        let positions_krw: Decimal = rows.iter().map(|(_, v)| *v).sum();
+        let equity = cash_krw + positions_krw;
+        rows.sort_by(|a, b| b.1.cmp(&a.1));
+        let positions = rows
+            .into_iter()
+            .map(|(mut p, v)| {
+                p.weight_pct = if equity.is_zero() { Decimal::ZERO } else { (v / equity * Decimal::ONE_HUNDRED).round_dp(2) };
+                p
+            })
+            .collect();
+        let summary = AccountSummary {
+            id: row.id,
+            name: row.name,
+            cash,
+            positions_value_krw: positions_krw.round_dp(0),
+            equity_krw: equity.round_dp(0),
+            usd_krw,
+            as_of: self.app.broker.now(),
+        };
+        Ok((summary, positions))
+    }
+
     fn quote(&self, id: &InstrumentId, error: Option<String>) -> Quote {
         let currency = id.venue.currency().code().to_string();
         let Some(v) = self.app.broker.book_view(id, 1) else {
@@ -233,39 +315,68 @@ impl Trader for TraderTools {
         })
     }
 
-    async fn estimate_order(&self, _order: OrderInput) -> zyris::Result<EstimateView> {
-        Err(zyris::Error::internal("not yet implemented"))
+    async fn estimate_order(&self, order: OrderInput) -> zyris::Result<EstimateView> {
+        let row = self.app.agent_account(&order.account)?;
+        let req = to_request(&order)?;
+        self.app.market.ensure_fresh(&req.instrument).await.map_err(|e| upstream(format!("{e:#}")))?;
+        self.app.broker.estimate(&row.id, &req).map(EstimateView::from).map_err(order_error)
     }
 
-    async fn place_order(&self, _order: OrderInput) -> zyris::Result<PlaceResult> {
-        Err(zyris::Error::internal("not yet implemented"))
+    async fn place_order(&self, order: OrderInput) -> zyris::Result<PlaceResult> {
+        let row = self.app.agent_account(&order.account)?;
+        let req = to_request(&order)?;
+        self.app.market.ensure_fresh(&req.instrument).await.map_err(|e| upstream(format!("{e:#}")))?;
+        let (placed, fills) = self.app.broker.place_sync(&row.id, req).map_err(order_error)?;
+        self.app.market.refresh_pins();
+        Ok(PlaceResult { order: OrderView::from(&placed), fills: fills.iter().map(FillView::from).collect() })
     }
 
-    async fn cancel_order(&self, _account: String, _order_id: u64) -> zyris::Result<OrderView> {
-        Err(zyris::Error::internal("not yet implemented"))
+    async fn cancel_order(&self, account: String, order_id: u64) -> zyris::Result<OrderView> {
+        let row = self.app.agent_account(&account)?;
+        let order = self.app.broker.cancel_sync(&row.id, order_id).map_err(order_error)?;
+        self.app.market.refresh_pins();
+        Ok(OrderView::from(&order))
     }
 
-    async fn list_orders(&self, _account: String, _open_only: Option<bool>, _limit: Option<u32>) -> zyris::Result<Vec<OrderView>> {
-        Err(zyris::Error::internal("not yet implemented"))
+    async fn list_orders(&self, account: String, open_only: Option<bool>, limit: Option<u32>) -> zyris::Result<Vec<OrderView>> {
+        let row = self.app.agent_account(&account)?;
+        let orders = self
+            .app
+            .store
+            .orders(&row.id, row.generation, open_only.unwrap_or(false), clamp_limit(limit))
+            .await
+            .map_err(upstream)?;
+        Ok(orders.iter().map(OrderView::from).collect())
     }
 
-    async fn list_fills(&self, _account: String, _since: Option<DateTime<Utc>>, _limit: Option<u32>) -> zyris::Result<Vec<FillView>> {
-        Err(zyris::Error::internal("not yet implemented"))
+    async fn list_fills(&self, account: String, since: Option<DateTime<Utc>>, limit: Option<u32>) -> zyris::Result<Vec<FillView>> {
+        let row = self.app.agent_account(&account)?;
+        let fills = self.app.store.fills(&row.id, row.generation, since, clamp_limit(limit)).await.map_err(upstream)?;
+        Ok(fills.iter().map(FillView::from).collect())
     }
 
     async fn list_accounts(&self) -> zyris::Result<Vec<AccountInfo>> {
-        Err(zyris::Error::internal("not yet implemented"))
+        Ok(self
+            .app
+            .agent_accounts()
+            .into_iter()
+            .map(|r| AccountInfo { id: r.id, name: r.name, generation: r.generation })
+            .collect())
     }
 
-    async fn get_account(&self, _account: String) -> zyris::Result<AccountSummary> {
-        Err(zyris::Error::internal("not yet implemented"))
+    async fn get_account(&self, account: String) -> zyris::Result<AccountSummary> {
+        Ok(self.valuation(&account).await?.0)
     }
 
-    async fn get_positions(&self, _account: String) -> zyris::Result<Vec<PositionView>> {
-        Err(zyris::Error::internal("not yet implemented"))
+    async fn get_positions(&self, account: String) -> zyris::Result<Vec<PositionView>> {
+        Ok(self.valuation(&account).await?.1)
     }
 
-    async fn convert_currency(&self, _account: String, _from: String, _to: String, _amount: Decimal) -> zyris::Result<ConversionView> {
-        Err(zyris::Error::internal("not yet implemented"))
+    async fn convert_currency(&self, account: String, from: String, to: String, amount: Decimal) -> zyris::Result<ConversionView> {
+        let row = self.app.agent_account(&account)?;
+        let (from, to) = (parse_currency(&from)?, parse_currency(&to)?);
+        let usd_krw = self.app.fx.usd_krw().await.map_err(|e| upstream(format!("{e:#}")))?;
+        let c = self.app.broker.convert_sync(&row.id, from, to, amount, usd_krw, self.app.fx_spread).map_err(order_error)?;
+        Ok(ConversionView::from(&c))
     }
 }
