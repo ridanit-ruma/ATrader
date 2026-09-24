@@ -374,3 +374,15 @@ fn bad_conversions_change_nothing() {
     assert_eq!(b.convert_sync("nobody", Currency::Krw, Currency::Usd, dec!(1), dec!(1365), dec!(0)), Err(OrderError::UnknownAccount));
     assert_eq!(b.portfolio("a").unwrap(), before);
 }
+
+#[test]
+fn conversions_that_lose_money_are_rejected() {
+    let (b, _) = setup();
+    let before = b.portfolio("a").unwrap();
+    let r = |from, to, amount, spread| b.convert_sync("a", from, to, amount, dec!(1365.35), spread);
+    assert!(matches!(r(Currency::Krw, Currency::Usd, dec!(13), dec!(0.001)), Err(OrderError::InvalidRequest(_)))); // credit rounds to 0
+    assert!(matches!(r(Currency::Krw, Currency::Usd, dec!(0.5), dec!(0)), Err(OrderError::InvalidRequest(_)))); // below 1 won
+    assert!(matches!(r(Currency::Krw, Currency::Usd, dec!(1365350), dec!(-0.1)), Err(OrderError::InvalidRequest(_))));
+    assert!(matches!(r(Currency::Krw, Currency::Usd, dec!(1365350), dec!(1)), Err(OrderError::InvalidRequest(_))));
+    assert_eq!(b.portfolio("a").unwrap(), before);
+}

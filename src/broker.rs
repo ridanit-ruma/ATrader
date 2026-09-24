@@ -497,10 +497,19 @@ impl SimBroker {
         usd_krw: Decimal,
         spread: Decimal,
     ) -> Result<Conversion, OrderError> {
-        if from == to || amount <= Decimal::ZERO || amount > MAX_INPUT || usd_krw <= Decimal::ZERO {
-            return Err(OrderError::InvalidRequest(
-                "convert needs two different currencies, a positive amount and a positive rate".into(),
-            ));
+        let valid = from != to
+            && amount > Decimal::ZERO
+            && amount <= MAX_INPUT
+            && amount.normalize().scale() <= from.decimals()
+            && usd_krw > Decimal::ZERO
+            && spread >= Decimal::ZERO
+            && spread < Decimal::ONE;
+        if !valid {
+            return Err(OrderError::InvalidRequest(format!(
+                "convert needs two different currencies, a positive amount in whole {} units of {} and a positive rate",
+                from.code(),
+                from.decimals()
+            )));
         }
         let mut w = self.world.lock().unwrap();
         let pf = w.accounts.get_mut(account).ok_or(OrderError::UnknownAccount)?;
@@ -511,6 +520,9 @@ impl SimBroker {
         let krw_per = |c: Currency| if c == Currency::Krw { Decimal::ONE } else { usd_krw };
         let net = Decimal::ONE - spread;
         let credit = (amount * krw_per(from) * net / krw_per(to)).round_dp_with_strategy(to.decimals(), RoundingStrategy::ToZero);
+        if credit <= Decimal::ZERO {
+            return Err(OrderError::InvalidRequest(format!("{amount} {} is too small to convert", from.code())));
+        }
         *pf.cash.entry(from).or_default() -= amount;
         *pf.cash.entry(to).or_default() += credit;
         Ok(Conversion { from, to, debit: amount, credit, rate: (krw_per(from) * net / krw_per(to)).round_dp(8) })

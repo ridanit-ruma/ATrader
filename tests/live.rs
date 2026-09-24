@@ -53,6 +53,6 @@ async fn binance_live() {
 #[tokio::test]
 #[ignore]
 async fn fx_live() {
-    let rate = FxCache::new(reqwest::Client::new()).usd_krw().await.unwrap();
+    let rate = FxCache::new().usd_krw().await.unwrap();
     assert!(rate > rust_decimal::Decimal::from(500) && rate < rust_decimal::Decimal::from(5000), "rate {rate}");
 }

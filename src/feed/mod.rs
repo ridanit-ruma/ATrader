@@ -34,8 +34,21 @@ pub trait MarketFeed: Send + Sync {
 /// No data for this long means the socket is dead.
 pub const IDLE_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
-/// Keep `feed` streaming whatever `subs` currently holds. A changed set restarts the stream.
-/// Drops reconnect with capped exponential backoff.
+/// The next item of `s`, or an error once nothing has arrived for `IDLE_TIMEOUT`.
+pub async fn next_or_idle<S: futures_util::Stream + Unpin>(s: &mut S, venue: &str) -> anyhow::Result<S::Item> {
+    use futures_util::StreamExt;
+    tokio::time::timeout(IDLE_TIMEOUT, s.next())
+        .await
+        .map_err(|_| anyhow::anyhow!("{venue}: no data for {IDLE_TIMEOUT:?}"))?
+        .ok_or_else(|| anyhow::anyhow!("{venue} websocket closed"))
+}
+
+/// How long the subscription set must stay unchanged before the stream restarts with it.
+pub const SETTLE: StdDuration = StdDuration::from_secs(1);
+
+/// Keep `feed` streaming whatever `subs` currently holds. A changed set restarts the stream once
+/// it has settled for `SETTLE`, so a burst of changes costs one reconnect. Drops reconnect with
+/// capped exponential backoff, which a set change cuts short.
 // ponytail: resubscribing = reconnecting; send in-band SUBSCRIBE messages if churn gets high.
 pub async fn run_feed(feed: Arc<dyn MarketFeed>, mut subs: watch::Receiver<Vec<InstrumentId>>, tx: mpsc::Sender<MarketEvent>) {
     let mut backoff = StdDuration::from_secs(1);
@@ -48,25 +61,53 @@ pub async fn run_feed(feed: Arc<dyn MarketFeed>, mut subs: watch::Receiver<Vec<I
             continue;
         }
         let started = Instant::now();
-        tokio::select! {
-            r = feed.stream(&ids, &tx) => {
-                if tx.is_closed() {
-                    return;
-                }
-                if let Err(e) = r {
-                    tracing::warn!(venue = feed.venue().tag(), error = %e, "feed stream ended");
-                }
-                if started.elapsed() > StdDuration::from_secs(60) {
-                    backoff = StdDuration::from_secs(1);
-                }
-                tokio::time::sleep(backoff + jitter(backoff)).await;
-                backoff = (backoff * 2).min(StdDuration::from_secs(60));
-            }
+        let ended = tokio::select! {
+            r = feed.stream(&ids, &tx) => Some(r),
             changed = subs.changed() => {
                 if changed.is_err() {
                     return;
                 }
+                None
             }
+        };
+        let Some(r) = ended else {
+            if !settle(&mut subs).await {
+                return;
+            }
+            continue;
+        };
+        if tx.is_closed() {
+            return;
+        }
+        if let Err(e) = r {
+            tracing::warn!(venue = feed.venue().tag(), error = %e, "feed stream ended");
+        }
+        if started.elapsed() > StdDuration::from_secs(60) {
+            backoff = StdDuration::from_secs(1);
+        }
+        let wait = backoff + jitter(backoff);
+        backoff = (backoff * 2).min(StdDuration::from_secs(60));
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            changed = subs.changed() => {
+                if changed.is_err() || !settle(&mut subs).await {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Wait until `subs` has been quiet for `SETTLE`. False once the sender is gone.
+async fn settle(subs: &mut watch::Receiver<Vec<InstrumentId>>) -> bool {
+    loop {
+        tokio::select! {
+            changed = subs.changed() => {
+                if changed.is_err() {
+                    return false;
+                }
+            }
+            _ = tokio::time::sleep(SETTLE) => return true,
         }
     }
 }
@@ -109,6 +150,82 @@ mod tests {
             tx.send(MarketEvent::Trade(t)).await?;
             anyhow::bail!("dropped")
         }
+    }
+
+    /// Records the ids of every connection, sends one trade, then either hangs or fails.
+    struct Recorder {
+        calls: std::sync::Mutex<Vec<(tokio::time::Instant, Vec<InstrumentId>)>>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl MarketFeed for Recorder {
+        fn venue(&self) -> Venue {
+            Venue::Upbit
+        }
+        async fn instruments(&self) -> anyhow::Result<Vec<Instrument>> {
+            Ok(vec![])
+        }
+        async fn snapshot(&self, _: &InstrumentId) -> anyhow::Result<Book> {
+            anyhow::bail!("unused")
+        }
+        async fn daily_stats(&self, _: &InstrumentId) -> anyhow::Result<DailyStats> {
+            anyhow::bail!("unused")
+        }
+        async fn stream(&self, ids: &[InstrumentId], tx: &mpsc::Sender<MarketEvent>) -> anyhow::Result<()> {
+            self.calls.lock().unwrap().push((tokio::time::Instant::now(), ids.to_vec()));
+            if self.fail {
+                anyhow::bail!("refused");
+            }
+            let t = Trade { instrument: ids[0].clone(), price: Decimal::ONE, qty: Decimal::ONE, at: Utc::now() };
+            tx.send(MarketEvent::Trade(t)).await?;
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+    }
+
+    fn id(s: &str) -> InstrumentId {
+        format!("UPBIT:{s}").parse().unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rapid_set_changes_reconnect_once_with_the_final_set() {
+        let feed = Arc::new(Recorder { calls: Default::default(), fail: false });
+        let (subs_tx, subs_rx) = watch::channel(vec![id("A")]);
+        let (tx, mut rx) = mpsc::channel(8);
+        tokio::spawn(run_feed(feed.clone(), subs_rx, tx));
+        rx.recv().await.unwrap();
+        subs_tx.send(vec![id("A"), id("B")]).unwrap();
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+        subs_tx.send(vec![id("A"), id("B"), id("C")]).unwrap();
+        rx.recv().await.unwrap();
+        let calls = feed.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].1, vec![id("A"), id("B"), id("C")]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_set_change_cuts_the_backoff_short() {
+        let feed = Arc::new(Recorder { calls: Default::default(), fail: true });
+        let (subs_tx, subs_rx) = watch::channel(vec![id("A")]);
+        let (tx, _rx) = mpsc::channel(8);
+        tokio::spawn(run_feed(feed.clone(), subs_rx, tx));
+        tokio::time::sleep(StdDuration::from_secs(20)).await; // several failures: backoff is now >= 8 s
+        let changed_at = tokio::time::Instant::now();
+        subs_tx.send(vec![id("B")]).unwrap();
+        tokio::time::sleep(StdDuration::from_secs(3)).await;
+        let calls = feed.calls.lock().unwrap();
+        let (at, ids) = calls.last().unwrap();
+        assert_eq!(ids, &vec![id("B")]);
+        assert!(*at - changed_at < StdDuration::from_secs(3));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_stream_times_out() {
+        let mut silent = futures_util::stream::pending::<u8>();
+        let started = tokio::time::Instant::now();
+        assert!(next_or_idle(&mut silent, "test").await.is_err());
+        assert!(started.elapsed() >= IDLE_TIMEOUT);
     }
 
     fn btc() -> InstrumentId {

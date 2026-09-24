@@ -26,9 +26,9 @@ pub struct FxCache {
 }
 
 impl FxCache {
-    pub fn new(http: reqwest::Client) -> Self {
+    pub fn new() -> Self {
         crate::init_tls();
-        FxCache { http, cached: Mutex::new(None) }
+        FxCache { http: reqwest::Client::new(), cached: Mutex::new(None) }
     }
 
     /// KRW per USD. Refreshes after an hour; if the refresh fails, the last good rate is used.

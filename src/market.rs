@@ -11,7 +11,6 @@ use tokio::sync::{broadcast, mpsc, watch};
 use crate::broker::{Fill, SimBroker};
 use crate::domain::{InstrumentId, Venue};
 use crate::feed::{MarketEvent, MarketFeed};
-use crate::sim::{DailyStats, SimParams};
 use crate::subs::Subscriptions;
 
 /// Everything downstream consumers (SSE, alerts, persistence) listen to.
@@ -76,12 +75,12 @@ impl Market {
         let vf = self.venues.get(&id.venue).ok_or_else(|| anyhow!("no feed for venue {}", id.venue.tag()))?;
         vf.subs.touch(id);
         if !self.broker.has_stats(id) {
-            let stats = vf.feed.daily_stats(id).await.unwrap_or_else(|e| {
-                tracing::warn!(instrument = %id, error = %e, "daily stats unavailable; using defaults");
-                let p = SimParams::default_for(id.venue);
-                DailyStats { sigma: p.default_sigma, adv_notional: p.default_adv }
-            });
-            self.broker.set_stats(id.clone(), stats);
+            // On failure the broker keeps using its defaults and the next call retries.
+            // ponytail: stats load once per process; refresh daily when runs last longer than a day.
+            match vf.feed.daily_stats(id).await {
+                Ok(stats) => self.broker.set_stats(id.clone(), stats),
+                Err(e) => tracing::warn!(instrument = %id, error = %e, "daily stats unavailable; using defaults"),
+            }
         }
         let fresh = self.broker.book_age(id).is_some_and(|age| age <= Duration::seconds(2));
         if !fresh {
@@ -132,6 +131,7 @@ mod tests {
         clock: ManualClock,
         snaps: AtomicUsize,
         stats: AtomicUsize,
+        fail_first_stats: bool,
     }
 
     #[async_trait]
@@ -153,7 +153,9 @@ mod tests {
             Ok(book(&self.clock))
         }
         async fn daily_stats(&self, _: &InstrumentId) -> anyhow::Result<DailyStats> {
-            self.stats.fetch_add(1, Ordering::SeqCst);
+            if self.stats.fetch_add(1, Ordering::SeqCst) == 0 && self.fail_first_stats {
+                anyhow::bail!("transient");
+            }
             Ok(DailyStats { sigma: 0.02, adv_notional: dec!(50000000000) })
         }
         async fn stream(&self, _: &[InstrumentId], _: &mpsc::Sender<MarketEvent>) -> anyhow::Result<()> {
@@ -171,12 +173,16 @@ mod tests {
     }
 
     async fn rig() -> Rig {
+        rig_with(false).await
+    }
+
+    async fn rig_with(fail_first_stats: bool) -> Rig {
         let clock = ManualClock::new(Utc.with_ymd_and_hms(2026, 9, 23, 1, 0, 0).unwrap());
         let broker = Arc::new(SimBroker::new(Arc::new(clock.clone()), Calendar::default()));
         broker.open_account("a", &[(Currency::Krw, dec!(1000000000))]);
         let (bus, _) = broadcast::channel(64);
         let mut market = Market::new(broker.clone(), bus.clone());
-        let feed = Arc::new(Fake { clock: clock.clone(), snaps: AtomicUsize::new(0), stats: AtomicUsize::new(0) });
+        let feed = Arc::new(Fake { clock: clock.clone(), snaps: AtomicUsize::new(0), stats: AtomicUsize::new(0), fail_first_stats });
         let subs = market.add_feed(feed.clone(), 10);
         assert_eq!(market.load_instruments().await.unwrap(), 1);
         Rig { clock, broker, feed, market, subs, bus }
@@ -195,6 +201,16 @@ mod tests {
         r.market.ensure_fresh(&btc()).await.unwrap();
         assert_eq!(r.feed.snaps.load(Ordering::SeqCst), 2);
         assert_eq!(r.feed.stats.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_stats_fetch_is_retried_later() {
+        let r = rig_with(true).await;
+        r.market.ensure_fresh(&btc()).await.unwrap();
+        assert!(!r.broker.has_stats(&btc()));
+        r.market.ensure_fresh(&btc()).await.unwrap();
+        assert!(r.broker.has_stats(&btc()));
+        assert_eq!(r.feed.stats.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

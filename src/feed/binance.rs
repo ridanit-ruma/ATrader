@@ -5,14 +5,13 @@ use std::sync::Arc;
 use anyhow::{Context, anyhow};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use futures_util::StreamExt;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
-use super::{IDLE_TIMEOUT, MarketEvent, MarketFeed};
+use super::{MarketEvent, MarketFeed, next_or_idle};
 use crate::domain::{Book, Clock, InstrumentId, Level, Trade, Venue};
 use crate::sim::DailyStats;
 use crate::stats::daily_stats;
@@ -178,10 +177,7 @@ impl MarketFeed for BinanceFeed {
     async fn stream(&self, ids: &[InstrumentId], tx: &mpsc::Sender<MarketEvent>) -> anyhow::Result<()> {
         let (mut ws, _) = tokio_tungstenite::connect_async(stream_url(ids)).await?;
         loop {
-            let msg = tokio::time::timeout(IDLE_TIMEOUT, ws.next())
-                .await
-                .map_err(|_| anyhow!("binance: no data for {IDLE_TIMEOUT:?}"))?
-                .ok_or_else(|| anyhow!("binance websocket closed"))??;
+            let msg = next_or_idle(&mut ws, "binance").await??;
             let bytes = match msg {
                 Message::Text(t) => t.as_bytes().to_vec(),
                 Message::Binary(b) => b.to_vec(),
