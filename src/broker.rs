@@ -8,10 +8,10 @@ use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
-use crate::domain::{Book, Clock, Currency, InstrumentId, Side, Trade, Venue};
+use crate::domain::{Book, Clock, Currency, InstrumentId, Level, Side, Trade, Venue};
 use crate::ledger::Portfolio;
 use crate::sim::{self, DailyStats, Resting, ShadowState, SimParams, Size, Slice};
-use crate::venue::{Calendar, FeeSchedule, Instrument, price_band};
+use crate::venue::{Calendar, FeeSchedule, Instrument, TickRule, price_band};
 
 pub type AccountId = String;
 pub type OrderId = u64;
@@ -183,8 +183,17 @@ fn buy_reserve_per_unit(limit: Decimal, venue: Venue) -> Decimal {
     limit * (dec!(1) + FeeSchedule::default_for(venue).commission_bps / dec!(10000))
 }
 
+/// Above any real order, far below `Decimal` overflow once multiplied together.
+const MAX_INPUT: Decimal = dec!(1000000000000000);
+
 fn check_shape(req: &OrderRequest) -> Result<(), OrderError> {
     let bad = |m: &str| -> Result<(), OrderError> { Err(OrderError::InvalidRequest(m.into())) };
+    let size = match req.size {
+        Size::Qty(q) | Size::Notional(q) => q,
+    };
+    if size.abs() > MAX_INPUT || req.limit_price.is_some_and(|p| p.abs() > MAX_INPUT) {
+        return bad("size or price is out of range");
+    }
     match (req.kind, req.limit_price, req.size) {
         (OrderType::Limit, None, _) => return bad("limit orders need limit_price"),
         (OrderType::Limit, _, Size::Notional(_)) => return bad("limit orders are sized by qty"),
@@ -230,6 +239,10 @@ fn record_fill(w: &mut World, order: &mut Order, qty: Decimal, notional: Decimal
         liquidity,
         at: now,
     }
+}
+
+fn shadow_consume(w: &mut World, id: &InstrumentId, taker: Side, slices: &[Slice]) {
+    w.shadows.entry(id.clone()).or_default().consume(taker, slices);
 }
 
 /// Execute `slices` as a taker: deplete the book, push the price, book the fill.
@@ -287,7 +300,13 @@ impl SimBroker {
         self.world.lock().unwrap().next_order_id = id;
     }
 
+    /// Instruments with a non-positive tick or lot step are refused (they would divide by zero).
     pub fn add_instrument(&self, instrument: Instrument) {
+        let tick_ok = !matches!(instrument.tick, TickRule::Fixed(t) if t <= Decimal::ZERO);
+        if !tick_ok || instrument.lot.step <= Decimal::ZERO {
+            tracing::warn!(instrument = %instrument.id, "refusing instrument with zero tick or lot step");
+            return;
+        }
         self.world.lock().unwrap().instruments.insert(instrument.id.clone(), instrument);
     }
 
@@ -316,13 +335,20 @@ impl SimBroker {
         shadow.offset
     }
 
-    /// A new real order book arrived. Resting orders it crosses fill as takers.
-    pub fn on_book(&self, book: Book) -> Vec<Fill> {
+    /// A new real order book arrived. Resting orders it crosses fill at their limit (spec §5).
+    /// Levels with a non-positive price or quantity are dropped.
+    pub fn on_book(&self, mut book: Book) -> Vec<Fill> {
         let now = self.clock.now();
         let mut guard = self.world.lock().unwrap();
         let w = &mut *guard;
+        let sane = |l: &Level| l.price > Decimal::ZERO && l.qty > Decimal::ZERO;
+        book.bids.retain(sane);
+        book.asks.retain(sane);
         let id = book.instrument.clone();
         w.books.insert(id.clone(), book);
+        if !self.calendar.is_open(id.venue, now) {
+            return Vec::new();
+        }
         let Some(inst) = w.instruments.get(&id) else { return Vec::new() };
         let (tick, step) = (inst.tick.clone(), inst.lot.step);
         let params = SimParams::default_for(id.venue);
@@ -342,9 +368,11 @@ impl SimBroker {
             }
             let (qty, _) = sim::totals(&slices);
             r.remaining -= qty;
+            // The crossing liquidity is used up, but we fill at our own limit and move no price.
+            shadow_consume(w, &id, r.side, &slices);
             let mut order = w.orders.remove(&r.order_id).expect("resting order is tracked");
             release(w, &order, qty);
-            fills.push(take(w, &mut order, &slices, now));
+            fills.push(record_fill(w, &mut order, qty, qty * r.price, Liquidity::Maker, now));
             if r.remaining.is_zero() {
                 order.status = OrderStatus::Filled;
             }
@@ -364,6 +392,9 @@ impl SimBroker {
         let mut guard = self.world.lock().unwrap();
         let w = &mut *guard;
         let id = trade.instrument.clone();
+        if trade.price <= Decimal::ZERO || trade.qty <= Decimal::ZERO || !self.calendar.is_open(id.venue, now) {
+            return Vec::new();
+        }
         let Some(tick) = w.instruments.get(&id).map(|i| i.tick.clone()) else { return Vec::new() };
         let shadow = w.shadows.entry(id.clone()).or_default();
         shadow.decay(now, &SimParams::default_for(id.venue));
@@ -543,6 +574,9 @@ impl SimBroker {
         };
         let slices = sim::walk(opposite, req.side, walk_size, limit, lot.step);
         let (qty, notional) = sim::totals(&slices);
+        if matches!(req.size, Size::Notional(_)) && qty > Decimal::ZERO && !lot.is_valid(qty, notional / qty) {
+            return Err(bad_qty());
+        }
         let (fee, tax) = fees.cost(req.side, notional, venue.currency().decimals());
         let rest_qty = match (req.kind, req.tif, req.size) {
             (OrderType::Limit, Tif::Day | Tif::Gtc, Size::Qty(q)) => q - qty,

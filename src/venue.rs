@@ -1,4 +1,4 @@
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, RoundingStrategy};
 use rust_decimal_macros::dec;
 
 use crate::domain::{InstrumentId, Side, Venue};
@@ -116,7 +116,8 @@ impl FeeSchedule {
         FeeSchedule { commission_bps, sell_tax_bps, sell_reg_fee_bps }
     }
 
-    /// (fee, tax) for one execution of `notional`, rounded to `dp` decimal places.
+    /// (fee, tax) for one execution of `notional`, truncated to `dp` decimal places (brokers drop
+    /// the sub-unit remainder). Truncation also keeps a fee within the commission reserved for it.
     pub fn cost(&self, side: Side, notional: Decimal, dp: u32) -> (Decimal, Decimal) {
         let bps = |b: Decimal| notional * b / dec!(10000);
         let mut fee = bps(self.commission_bps);
@@ -125,7 +126,10 @@ impl FeeSchedule {
             fee += bps(self.sell_reg_fee_bps);
             tax = bps(self.sell_tax_bps);
         }
-        (fee.round_dp(dp), tax.round_dp(dp))
+        (
+            fee.round_dp_with_strategy(dp, RoundingStrategy::ToZero),
+            tax.round_dp_with_strategy(dp, RoundingStrategy::ToZero),
+        )
     }
 }
 
@@ -242,7 +246,7 @@ mod tests {
         assert_eq!(krx.cost(Side::Sell, dec!(1000000), 0), (dec!(150), dec!(2000)));
         assert_eq!(krx.cost(Side::Buy, dec!(1000000), 0), (dec!(150), dec!(0)));
         let us = FeeSchedule::default_for(Venue::Us);
-        assert_eq!(us.cost(Side::Sell, dec!(10000), 2), (dec!(0.28), dec!(0)));
+        assert_eq!(us.cost(Side::Sell, dec!(10000), 2), (dec!(0.27), dec!(0)));
         let upbit = FeeSchedule::default_for(Venue::Upbit);
         assert_eq!(upbit.cost(Side::Buy, dec!(1000000), 0), (dec!(500), dec!(0)));
     }

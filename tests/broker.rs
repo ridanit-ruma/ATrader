@@ -214,15 +214,6 @@ fn queue_ahead_is_served_first() {
 }
 
 #[test]
-fn book_crossing_a_resting_order_fills_it_as_taker() {
-    let (b, clock) = setup();
-    let (order, _) = b.place_sync("a", limit(btc(), Side::Buy, dec!(0.1), dec!(99998000), Tif::Gtc)).unwrap();
-    let f = b.on_book(book(&clock, btc(), &[(dec!(99990000), dec!(1))], &[(dec!(99997000), dec!(0.5))]));
-    assert_eq!((f[0].qty, f[0].price, f[0].liquidity), (dec!(0.1), dec!(99997000), Liquidity::Taker));
-    assert_eq!(b.order(order.id).unwrap().status, OrderStatus::Filled);
-}
-
-#[test]
 fn cancel_releases_the_reservation() {
     let (b, _) = setup();
     let (order, _) = b.place_sync("a", limit(btc(), Side::Buy, dec!(0.1), dec!(99998000), Tif::Gtc)).unwrap();
@@ -262,4 +253,86 @@ async fn cancel_works_through_the_broker_trait() {
     let broker: Arc<dyn Broker> = Arc::new(b);
     let (order, _) = broker.place("a", limit(btc(), Side::Buy, dec!(0.1), dec!(99998000), Tif::Gtc)).await.unwrap();
     assert_eq!(broker.cancel("a", order.id).await.unwrap().status, OrderStatus::Cancelled);
+}
+
+// --- Final review fixes ---
+
+#[test]
+fn absurd_sizes_are_rejected_without_poisoning_the_broker() {
+    let (b, _) = setup();
+    assert!(b.place_sync("a", market_buy(dec!(79228162514264337593543950335))).is_err());
+    let huge_notional = req(btc(), Side::Buy, OrderType::Market, Size::Notional(dec!(10000000000000000000000000000)), None, Tif::Ioc);
+    assert!(b.place_sync("a", huge_notional).is_err());
+    let huge_limit = limit(btc(), Side::Buy, dec!(1), dec!(7000000000000000000000000000), Tif::Gtc);
+    assert!(b.place_sync("a", huge_limit).is_err());
+    assert_eq!(b.place_sync("a", market_buy(dec!(0.1))).unwrap().0.status, OrderStatus::Filled);
+}
+
+#[test]
+fn zero_price_levels_and_bad_prints_are_ignored() {
+    let (b, clock) = setup();
+    b.on_book(book(&clock, btc(), &[(dec!(0), dec!(1))], &[(dec!(0), dec!(1))]));
+    let r = req(btc(), Side::Buy, OrderType::Market, Size::Notional(dec!(10000)), None, Tif::Ioc);
+    assert_eq!(b.place_sync("a", r), Err(OrderError::NoLiquidity));
+    assert!(b.estimate("a", &market_buy(dec!(0.1))).is_err());
+    b.on_book(btc_book(&clock));
+    b.place_sync("a", limit(btc(), Side::Buy, dec!(0.1), dec!(99998000), Tif::Gtc)).unwrap();
+    assert!(b.on_trade(trade(&clock, btc(), dec!(99990000), dec!(-1))).is_empty());
+    assert!(b.on_trade(trade(&clock, btc(), dec!(0), dec!(1))).is_empty());
+}
+
+#[test]
+fn instruments_with_zero_tick_or_step_are_refused() {
+    let (b, _) = setup();
+    let bad: InstrumentId = "UPBIT:KRW-BAD".parse().unwrap();
+    b.add_instrument(Instrument {
+        id: bad.clone(),
+        name: "Bad".into(),
+        tick: TickRule::Fixed(dec!(0)),
+        lot: LotRule { step: dec!(0), min_qty: dec!(0), min_notional: dec!(0) },
+        tradable: true,
+    });
+    let r = req(bad, Side::Buy, OrderType::Market, Size::Qty(dec!(1)), None, Tif::Ioc);
+    assert_eq!(b.place_sync("a", r), Err(OrderError::UnknownInstrument));
+}
+
+#[test]
+fn notional_buy_below_minimum_after_fees_is_rejected() {
+    let (b, _) = setup();
+    let r = req(btc(), Side::Buy, OrderType::Market, Size::Notional(dec!(5000)), None, Tif::Ioc);
+    assert!(matches!(b.place_sync("a", r), Err(OrderError::InvalidQty { .. })));
+    assert!(b.portfolio("a").unwrap().positions.is_empty());
+}
+
+#[test]
+fn resting_buy_fees_never_overdraw_cash() {
+    let (b, clock) = setup();
+    b.open_account("tight", &[(Currency::Krw, dec!(500075))]); // exactly 10 x 50,000 + 1.5 bps
+    b.place_sync("tight", limit(samsung(), Side::Buy, dec!(10), dec!(50000), Tif::Day)).unwrap();
+    for _ in 0..10 {
+        b.on_trade(trade(&clock, samsung(), dec!(50000), dec!(1)));
+    }
+    let pf = b.portfolio("tight").unwrap();
+    assert_eq!(pf.positions[&samsung()].qty, dec!(10));
+    assert!(pf.cash(Currency::Krw) >= dec!(0), "cash {}", pf.cash(Currency::Krw));
+}
+
+#[test]
+fn crossed_resting_order_fills_at_its_limit_as_maker() {
+    let (b, clock) = setup();
+    let (order, _) = b.place_sync("a", limit(btc(), Side::Buy, dec!(0.1), dec!(99998000), Tif::Gtc)).unwrap();
+    let f = b.on_book(book(&clock, btc(), &[(dec!(99990000), dec!(1))], &[(dec!(99997000), dec!(0.5))]));
+    assert_eq!((f[0].qty, f[0].price, f[0].liquidity), (dec!(0.1), dec!(99998000), Liquidity::Maker));
+    assert_eq!(b.order(order.id).unwrap().status, OrderStatus::Filled);
+    assert_eq!(b.shadow_offset(&btc()), 0.0); // makers leave no permanent impact
+}
+
+#[test]
+fn closed_market_books_do_not_fill_day_orders() {
+    let (b, clock) = setup();
+    let (order, _) = b.place_sync("a", limit(samsung(), Side::Buy, dec!(10), dec!(69900), Tif::Day)).unwrap();
+    clock.set(Utc.with_ymd_and_hms(2026, 9, 23, 6, 35, 0).unwrap()); // 15:35 KST
+    assert!(b.on_book(book(&clock, samsung(), &[(dec!(69700), dec!(100))], &[(dec!(69800), dec!(100))])).is_empty());
+    assert!(b.on_trade(trade(&clock, samsung(), dec!(69800), dec!(100))).is_empty());
+    assert_eq!(b.order(order.id).unwrap().status, OrderStatus::Open);
 }
