@@ -1,0 +1,38 @@
+@import "tailwindcss";
+
+@theme {
+  --color-up-red: #e11d48;
+  --color-down-blue: #2563eb;
+  --color-up-green: #16a34a;
+  --color-down-red: #dc2626;
+}
+
+:root {
+  color-scheme: light dark;
+}
+
+body {
+  @apply bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100;
+  font-family: system-ui, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+}
+
+.card {
+  @apply rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900;
+}
+
+.input {
+  @apply w-full rounded border border-zinc-300 bg-white px-3 py-2 dark:border-zinc-700 dark:bg-zinc-900;
+}
+
+.btn {
+  @apply rounded bg-zinc-900 px-3 py-2 text-white hover:bg-zinc-700 disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300;
+}
+
+.btn-quiet {
+  @apply rounded border border-zinc-300 px-3 py-1 hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800;
+}
+
+.num {
+  font-variant-numeric: tabular-nums;
+  @apply text-right;
+}

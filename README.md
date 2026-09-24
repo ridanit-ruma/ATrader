@@ -7,8 +7,8 @@ node. It gives an Attacca agent the tools to research markets and trade on paper
 real-time market data, and it gives you a private dashboard showing every trade, the agent's
 reason for it, and how each account is doing.
 
-> **Status:** crypto paper trading (Upbit, Binance) works end to end through zyris. Korean
-> and US stocks, research tools, alerts and the dashboard are still in progress. See the
+> **Status:** paper trading, research tools, alerts and the dashboard work. Korean and US stocks
+> (KIS) are implemented but not yet verified against live keys; the NixOS deployment is next. See the
 > [design spec](docs/superpowers/specs/2026-09-24-atrader-design.md) and
 > [plans](docs/superpowers/plans/).
 
@@ -61,6 +61,13 @@ companies. KIS keys (`KIS_APP_KEY`, `KIS_APP_SECRET`) enable Korean and US stock
 before a reset: a running server keeps trading the old state in memory.
 
 ## Dashboard
+
+Build the dashboard before the binary, which embeds `web/dist`:
+
+```bash
+(cd web && npm ci && npm run build)
+cargo build --release
+```
 
 `atrader serve` also serves the dashboard on `127.0.0.1:8750` (set `ATRADER_HTTP_ADDR` to change
 it). Create the one login with `atrader user create <name>`; the first sign-in enrols an
