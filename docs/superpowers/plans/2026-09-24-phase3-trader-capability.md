@@ -784,7 +784,7 @@ async fn rig(pool: PgPool) -> (Arc<App>, TraderTools) {
     let broker = Arc::new(SimBroker::new(Arc::new(clock.clone()), Calendar::default()).with_journal(jtx));
     restore(&store, &broker).await.unwrap();
     let (bus, _) = broadcast::channel(64);
-    let mut market = Market::new(broker.clone(), bus.clone());
+    let mut market = Market::new(broker.clone());
     let _subs = market.add_feed(Arc::new(Fake { clock }), 10);
     market.load_instruments().await.unwrap();
     tokio::spawn(persist(jrx, store.clone(), bus));
@@ -2182,7 +2182,7 @@ async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
     let (journal_tx, journal_rx) = mpsc::unbounded_channel();
     let broker = Arc::new(SimBroker::new(clock.clone(), calendar).with_journal(journal_tx));
     let (bus, _) = broadcast::channel(1024);
-    let mut market = Market::new(broker.clone(), bus.clone());
+    let mut market = Market::new(broker.clone());
 
     let (events_tx, events_rx) = mpsc::channel(4096);
     let feeds: Vec<(Arc<dyn MarketFeed>, usize)> =

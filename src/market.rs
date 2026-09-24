@@ -8,29 +8,33 @@ use anyhow::anyhow;
 use chrono::Duration;
 use tokio::sync::{broadcast, mpsc, watch};
 
-use crate::broker::{Fill, SimBroker};
+use crate::broker::{Fill, Order, SimBroker};
 use crate::domain::{InstrumentId, Venue};
 use crate::feed::{MarketEvent, MarketFeed};
 use crate::subs::Subscriptions;
 
-/// Everything downstream consumers (SSE, alerts, persistence) listen to.
+/// Everything downstream consumers (SSE, alerts) listen to. Orders and fills arrive here only
+/// after they are persisted (see persist.rs).
 #[derive(Debug, Clone)]
 pub enum BusEvent {
     Market(MarketEvent),
+    Order(Order),
     Fill(Fill),
 }
 
-/// Apply each market event to the broker, then broadcast it and any fills it caused.
+/// Apply each market event to the broker, then broadcast it. Fills it causes travel through the
+/// broker's journal.
 pub async fn pump(mut rx: mpsc::Receiver<MarketEvent>, broker: Arc<SimBroker>, bus: broadcast::Sender<BusEvent>) {
     while let Some(ev) = rx.recv().await {
-        let fills = match &ev {
-            MarketEvent::Book(b) => broker.on_book(b.clone()),
-            MarketEvent::Trade(t) => broker.on_trade(t.clone()),
-        };
-        let _ = bus.send(BusEvent::Market(ev));
-        for f in fills {
-            let _ = bus.send(BusEvent::Fill(f));
+        match &ev {
+            MarketEvent::Book(b) => {
+                broker.on_book(b.clone());
+            }
+            MarketEvent::Trade(t) => {
+                broker.on_trade(t.clone());
+            }
         }
+        let _ = bus.send(BusEvent::Market(ev));
     }
 }
 
@@ -41,13 +45,12 @@ struct VenueFeed {
 
 pub struct Market {
     broker: Arc<SimBroker>,
-    bus: broadcast::Sender<BusEvent>,
     venues: HashMap<Venue, VenueFeed>,
 }
 
 impl Market {
-    pub fn new(broker: Arc<SimBroker>, bus: broadcast::Sender<BusEvent>) -> Self {
-        Market { broker, bus, venues: HashMap::new() }
+    pub fn new(broker: Arc<SimBroker>) -> Self {
+        Market { broker, venues: HashMap::new() }
     }
 
     /// Register a feed. Hand the returned receiver to `feed::run_feed`.
@@ -85,9 +88,7 @@ impl Market {
         let fresh = self.broker.book_age(id).is_some_and(|age| age <= Duration::seconds(2));
         if !fresh {
             let book = vf.feed.snapshot(id).await?;
-            for f in self.broker.on_book(book) {
-                let _ = self.bus.send(BusEvent::Fill(f));
-            }
+            self.broker.on_book(book);
         }
         Ok(())
     }
@@ -181,7 +182,7 @@ mod tests {
         let broker = Arc::new(SimBroker::new(Arc::new(clock.clone()), Calendar::default()));
         broker.open_account("a", &[(Currency::Krw, dec!(1000000000))]);
         let (bus, _) = broadcast::channel(64);
-        let mut market = Market::new(broker.clone(), bus.clone());
+        let mut market = Market::new(broker.clone());
         let feed = Arc::new(Fake { clock: clock.clone(), snaps: AtomicUsize::new(0), stats: AtomicUsize::new(0), fail_first_stats });
         let subs = market.add_feed(feed.clone(), 10);
         assert_eq!(market.load_instruments().await.unwrap(), 1);
@@ -238,7 +239,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pump_applies_events_and_broadcasts_fills() {
+    async fn pump_applies_events_and_broadcasts_market_data() {
         let r = rig().await;
         let mut events = r.bus.subscribe();
         let (tx, rx) = mpsc::channel(8);
@@ -254,11 +255,10 @@ mod tests {
             tif: Tif::Gtc,
             reason: "test".into(),
         };
-        r.broker.place_sync("a", bid).unwrap();
+        let (order, _) = r.broker.place_sync("a", bid).unwrap();
         let t = Trade { instrument: btc(), price: dec!(99990000), qty: dec!(1), at: r.clock.now() };
         tx.send(MarketEvent::Trade(t)).await.unwrap();
         assert!(matches!(events.recv().await.unwrap(), BusEvent::Market(MarketEvent::Trade(_))));
-        let BusEvent::Fill(f) = events.recv().await.unwrap() else { panic!("expected a fill") };
-        assert_eq!(f.qty, dec!(0.1));
+        assert_eq!(r.broker.order(order.id).unwrap().status, crate::broker::OrderStatus::Filled);
     }
 }

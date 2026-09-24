@@ -144,3 +144,26 @@ async fn orders_and_fills_round_trip(pool: PgPool) {
     assert_eq!(store.fills("a", 1, None, 10).await.unwrap(), vec![f.clone()]);
     assert!(store.fills("a", 1, Some(f.at + chrono::Duration::seconds(1)), 10).await.unwrap().is_empty());
 }
+
+#[sqlx::test]
+async fn persister_writes_in_order_then_republishes(pool: PgPool) {
+    use atrader::market::BusEvent;
+    use atrader::persist::persist;
+    use std::sync::Arc;
+    let store = Arc::new(Store::new(pool));
+    store.create_account("a", "Test", None, &[(Currency::Krw, dec!(2000000))], Utc::now()).await.unwrap();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (bus, mut events) = tokio::sync::broadcast::channel(16);
+    tx.send(Journal::Order(order(1))).unwrap();
+    tx.send(Journal::Fill(fill(1, Side::Buy, dec!(10), dec!(700000), dec!(105), dec!(0)))).unwrap();
+    let c = Conversion { from: Currency::Krw, to: Currency::Usd, debit: dec!(1365350), credit: dec!(999), rate: dec!(0.00073167) };
+    tx.send(Journal::Conversion { account: "a".into(), conversion: c, at: Utc::now() }).unwrap();
+    drop(tx);
+    persist(rx, store.clone(), bus).await;
+
+    let cash = store.cash_balances("a", 1).await.unwrap();
+    assert_eq!(cash[&Currency::Krw], dec!(2000000) - dec!(700105) - dec!(1365350));
+    assert_eq!(cash[&Currency::Usd], dec!(999));
+    assert!(matches!(events.recv().await.unwrap(), BusEvent::Order(o) if o.id == 1));
+    assert!(matches!(events.recv().await.unwrap(), BusEvent::Fill(f) if f.order_id == 1));
+}
