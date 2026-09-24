@@ -60,6 +60,13 @@ companies. KIS keys (`KIS_APP_KEY`, `KIS_APP_SECRET`) enable Korean and US stock
 `atrader account reset <id>` starts an account over and keeps its history. Stop `atrader serve`
 before a reset: a running server keeps trading the old state in memory.
 
+## Alerts
+
+The agent can set alerts (price levels, % moves, volume surges, its own fills, market open and
+close). When one fires, ATrader messages the account's agent in a dedicated Attacca session with
+the agent's own note, so it can act without polling. The zyris credential needs the
+`agents:read`, `sessions:read` and `sessions:write` scopes for this.
+
 ## Stack
 
 Rust (tokio, axum, sqlx/Postgres) in a single binary, with a React dashboard served by the same

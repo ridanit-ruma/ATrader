@@ -495,3 +495,60 @@ pub struct FilingText {
     /// Plain text, up to 20,000 characters.
     pub text: String,
 }
+
+/// An alert to create. Kinds and what they need:
+/// `price_above` / `price_below`: instrument + threshold (price);
+/// `move`: instrument + threshold (percent) + window_minutes (1-240);
+/// `volume_surge`: instrument + threshold (multiple of the average pace, >= 1) + window_minutes;
+/// `order_filled`: optional instrument; `session_open` / `session_close`: venue (KRX or US).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AlertInput {
+    pub kind: String,
+    #[serde(default)]
+    pub instrument: Option<String>,
+    #[serde(default)]
+    pub venue: Option<String>,
+    #[serde(default)]
+    pub threshold: Option<Decimal>,
+    #[serde(default)]
+    pub window_minutes: Option<u32>,
+    /// What you want to remember when it fires — your plan for this moment.
+    pub note: String,
+    /// Fire once and turn off (default true); false re-arms after a 5-minute cooldown.
+    #[serde(default)]
+    pub once: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AlertView {
+    pub id: i64,
+    pub kind: String,
+    pub instrument: Option<String>,
+    pub venue: Option<String>,
+    pub threshold: Option<Decimal>,
+    pub window_minutes: Option<u32>,
+    pub note: String,
+    pub once: bool,
+    pub active: bool,
+    pub created_at: DateTime<Utc>,
+    pub last_fired_at: Option<DateTime<Utc>>,
+}
+
+impl AlertView {
+    pub fn from_alert(a: &crate::alerts::Alert, active: bool) -> Self {
+        let c = &a.condition;
+        AlertView {
+            id: a.id,
+            kind: c.kind().into(),
+            instrument: c.instrument().map(|i| i.to_string()),
+            venue: c.venue().map(|v| v.tag().into()),
+            threshold: c.threshold(),
+            window_minutes: c.window_minutes(),
+            note: a.note.clone(),
+            once: a.once,
+            active,
+            created_at: a.created_at,
+            last_fired_at: a.last_fired_at,
+        }
+    }
+}

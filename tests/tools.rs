@@ -405,3 +405,39 @@ async fn failed_deliveries_are_recorded(pool: PgPool) {
     assert!(!delivered);
     assert!(error.unwrap().contains("unreachable"));
 }
+
+fn alert_input(kind: &str) -> AlertInput {
+    AlertInput { kind: kind.into(), instrument: Some("UPBIT:KRW-BTC".into()), venue: None, threshold: Some(dec!(100000000)), window_minutes: None, note: "watch".into(), once: None }
+}
+
+#[sqlx::test]
+async fn alert_tools_validate_and_scope_to_the_account(pool: PgPool) {
+    let (_, t) = rig(pool).await;
+    let a = t.create_alert("bot".into(), alert_input("price_above")).await.unwrap();
+    assert!(a.once && a.id > 0);
+    assert_eq!(t.list_alerts("bot".into()).await.unwrap().len(), 1);
+
+    let mut m = alert_input("move");
+    assert_eq!(code(&t.create_alert("bot".into(), m.clone()).await.unwrap_err()), "InvalidParams"); // no window
+    m.window_minutes = Some(0);
+    assert_eq!(code(&t.create_alert("bot".into(), m.clone()).await.unwrap_err()), "InvalidParams");
+    m.window_minutes = Some(30);
+    m.threshold = Some(dec!(3));
+    t.create_alert("bot".into(), m).await.unwrap();
+
+    let mut no_threshold = alert_input("price_below");
+    no_threshold.threshold = None;
+    assert_eq!(code(&t.create_alert("bot".into(), no_threshold).await.unwrap_err()), "InvalidParams");
+    let mut unknown = alert_input("price_above");
+    unknown.instrument = Some("UPBIT:KRW-NOPE".into());
+    assert_eq!(code(&t.create_alert("bot".into(), unknown).await.unwrap_err()), "UNKNOWN_INSTRUMENT");
+    let session = AlertInput { kind: "session_open".into(), instrument: None, venue: Some("NASDAQ".into()), threshold: None, window_minutes: None, note: "x".into(), once: None };
+    assert_eq!(code(&t.create_alert("bot".into(), session).await.unwrap_err()), "InvalidParams");
+    assert_eq!(code(&t.create_alert("bot".into(), alert_input("teleport")).await.unwrap_err()), "InvalidParams");
+    assert_eq!(code(&t.create_alert("manual".into(), alert_input("price_above")).await.unwrap_err()), "UNKNOWN_ACCOUNT");
+
+    assert_eq!(code(&t.delete_alert("bot".into(), 999_999).await.unwrap_err()), "NOT_FOUND");
+    let gone = t.delete_alert("bot".into(), a.id).await.unwrap();
+    assert!(!gone.active);
+    assert_eq!(t.list_alerts("bot".into()).await.unwrap().len(), 1);
+}

@@ -110,6 +110,17 @@ pub trait Trader {
     /// A filing's text, 20,000 characters per page (`page` from 1; the answer says how many
     /// pages exist).
     async fn get_filing(&self, id: String, filing_id: String, page: Option<u32>) -> zyris::Result<FilingText>;
+
+    /// Get woken up when something happens: a price level, a % move, a volume surge, one of
+    /// your orders filling, or a stock market opening/closing. When it fires, this account's
+    /// Attacca session receives a message with your note. At most 50 active alerts per account.
+    async fn create_alert(&self, account: String, alert: AlertInput) -> zyris::Result<AlertView>;
+
+    /// Active alerts of an account.
+    async fn list_alerts(&self, account: String) -> zyris::Result<Vec<AlertView>>;
+
+    /// Turn an alert off.
+    async fn delete_alert(&self, account: String, alert_id: i64) -> zyris::Result<AlertView>;
 }
 
 pub struct TraderTools {
@@ -117,6 +128,35 @@ pub struct TraderTools {
 }
 
 impl TraderTools {
+    fn alert_condition(&self, a: &AlertInput) -> zyris::Result<crate::alerts::Condition> {
+        use crate::alerts::Condition;
+        let inst = || -> zyris::Result<InstrumentId> { self.known(a.instrument.as_deref().ok_or_else(|| bad(format!("{} needs an instrument", a.kind)))?) };
+        let threshold = |what: &str| a.threshold.filter(|t| *t > Decimal::ZERO).ok_or_else(|| bad(format!("{} needs a positive threshold ({what})", a.kind)));
+        let window = || a.window_minutes.filter(|w| (1..=240).contains(w)).ok_or_else(|| bad(format!("{} needs window_minutes between 1 and 240", a.kind)));
+        let venue = || -> zyris::Result<Venue> {
+            match a.venue.as_deref().map(parse_venue).transpose()? {
+                Some(v) if v.has_session() => Ok(v),
+                _ => Err(bad(format!("{} needs venue KRX or US", a.kind))),
+            }
+        };
+        Ok(match a.kind.trim() {
+            "price_above" => Condition::PriceAbove { id: inst()?, price: threshold("price")? },
+            "price_below" => Condition::PriceBelow { id: inst()?, price: threshold("price")? },
+            "move" => Condition::Move { id: inst()?, pct: threshold("percent")?, window_minutes: window()? },
+            "volume_surge" => {
+                let f = threshold("multiple of the average pace")?;
+                if f < Decimal::ONE {
+                    return Err(bad("volume_surge threshold must be at least 1"));
+                }
+                Condition::VolumeSurge { id: inst()?, factor: f, window_minutes: window()? }
+            }
+            "order_filled" => Condition::OrderFilled { id: a.instrument.as_deref().map(|i| self.known(i)).transpose()? },
+            "session_open" => Condition::SessionOpen { venue: venue()? },
+            "session_close" => Condition::SessionClose { venue: venue()? },
+            other => return Err(bad(format!("unknown alert kind {other:?}"))),
+        })
+    }
+
     pub fn new(app: Arc<App>) -> Self {
         TraderTools { app }
     }
@@ -605,5 +645,49 @@ impl Trader for TraderTools {
         let page = page.unwrap_or(1);
         let (chunk, pages) = crate::fundamentals::page_text(&text, page as usize).map_err(bad)?;
         Ok(FilingText { filing_id, page, pages: pages as u32, text: chunk })
+    }
+
+    async fn create_alert(&self, account: String, alert: AlertInput) -> zyris::Result<AlertView> {
+        let row = self.app.agent_account(&account)?;
+        let condition = self.alert_condition(&alert)?;
+        if alert.note.trim().is_empty() {
+            return Err(bad("note is required: say what you want to do when it fires"));
+        }
+        let active = self.app.store.active_alerts(&row.id, row.generation).await.map_err(upstream)?;
+        if active.len() >= 50 {
+            return Err(order_error(OrderError::InvalidRequest("50 active alerts is the limit; delete some first".into())));
+        }
+        let mut a = crate::alerts::Alert {
+            id: 0,
+            account: row.id.clone(),
+            generation: row.generation,
+            condition,
+            note: alert.note.trim().to_string(),
+            once: alert.once.unwrap_or(true),
+            created_at: self.app.broker.now(),
+            last_fired_at: None,
+        };
+        a.id = self.app.store.create_alert(&a).await.map_err(upstream)?;
+        if let Some(tx) = &self.app.alerts {
+            let _ = tx.send(crate::alerts::deliver::AlertCmd::Upsert(a.clone()));
+        }
+        Ok(AlertView::from_alert(&a, true))
+    }
+
+    async fn list_alerts(&self, account: String) -> zyris::Result<Vec<AlertView>> {
+        let row = self.app.agent_account(&account)?;
+        let alerts = self.app.store.active_alerts(&row.id, row.generation).await.map_err(upstream)?;
+        Ok(alerts.iter().map(|a| AlertView::from_alert(a, true)).collect())
+    }
+
+    async fn delete_alert(&self, account: String, alert_id: i64) -> zyris::Result<AlertView> {
+        let row = self.app.agent_account(&account)?;
+        let active = self.app.store.active_alerts(&row.id, row.generation).await.map_err(upstream)?;
+        let a = active.into_iter().find(|a| a.id == alert_id).ok_or_else(|| order_error(OrderError::NotFound))?;
+        self.app.store.deactivate_alert(&row.id, alert_id).await.map_err(upstream)?;
+        if let Some(tx) = &self.app.alerts {
+            let _ = tx.send(crate::alerts::deliver::AlertCmd::Remove(alert_id));
+        }
+        Ok(AlertView::from_alert(&a, false))
     }
 }

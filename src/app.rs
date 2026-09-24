@@ -21,12 +21,13 @@ pub struct App {
     pub fx_spread: Decimal,
     pub dart: Option<crate::fundamentals::dart::DartClient>,
     pub edgar: Option<crate::fundamentals::edgar::EdgarClient>,
+    pub alerts: Option<tokio::sync::mpsc::UnboundedSender<crate::alerts::deliver::AlertCmd>>,
     accounts: RwLock<HashMap<String, AccountRow>>,
 }
 
 impl App {
     pub async fn new(broker: Arc<SimBroker>, store: Arc<Store>, market: Market, fx: FxCache) -> anyhow::Result<Self> {
-        let app = App { broker, store, market, fx, fx_spread: dec!(0.001), dart: None, edgar: None, accounts: RwLock::new(HashMap::new()) };
+        let app = App { broker, store, market, fx, fx_spread: dec!(0.001), dart: None, edgar: None, alerts: None, accounts: RwLock::new(HashMap::new()) };
         app.reload_accounts().await?;
         Ok(app)
     }
@@ -34,6 +35,11 @@ impl App {
     pub fn with_fundamentals(mut self, dart: Option<crate::fundamentals::dart::DartClient>, edgar: Option<crate::fundamentals::edgar::EdgarClient>) -> Self {
         self.dart = dart;
         self.edgar = edgar;
+        self
+    }
+
+    pub fn with_alerts(mut self, tx: tokio::sync::mpsc::UnboundedSender<crate::alerts::deliver::AlertCmd>) -> Self {
+        self.alerts = Some(tx);
         self
     }
 

@@ -202,6 +202,8 @@ async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
     drop(events_tx);
     let instruments = market.load_instruments().await?;
     let generations = restore(&store, &broker).await?;
+    let slot = crate::alerts::deliver::ConnSlot::default();
+    let (alert_tx, alert_rx) = mpsc::unbounded_channel();
     tracing::info!(instruments, accounts = generations.len(), "state restored");
 
     tokio::spawn(pump(events_rx, broker.clone(), bus.clone()));
@@ -210,8 +212,9 @@ async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
     let dart = std::env::var("DART_API_KEY").ok().filter(|k| !k.trim().is_empty()).map(|k| crate::fundamentals::dart::DartClient::new(k.trim().into()));
     let edgar = std::env::var("EDGAR_USER_AGENT").ok().filter(|u| !u.trim().is_empty()).map(|u| crate::fundamentals::edgar::EdgarClient::new(u.trim().into()));
     tracing::info!(dart = dart.is_some(), edgar = edgar.is_some(), "fundamentals sources");
-    let app = Arc::new(App::new(broker.clone(), store, market, FxCache::new()).await?.with_fundamentals(dart, edgar));
+    let app = Arc::new(App::new(broker.clone(), store, market, FxCache::new()).await?.with_fundamentals(dart, edgar).with_alerts(alert_tx));
     app.market.refresh_pins();
+    tokio::spawn(crate::alerts::deliver::alert_loop(app.clone(), bus.subscribe(), alert_rx, Arc::new(crate::alerts::deliver::AttaccaNotifier::new(slot.clone())), generations.clone()));
     tokio::spawn(crate::app::snapshot_loop(app.clone(), generations));
 
     let timers = app.clone();
@@ -235,6 +238,13 @@ async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
         .name(name)
         .kind(zyris::NodeKind::Service)
         .capability(TraderServer(TraderTools::new(app)))
+        .on_connect({
+            let slot = slot.clone();
+            move |conn| {
+                let slot = slot.clone();
+                async move { slot.put(conn) }
+            }
+        })
         .build()?
         .connect(&server, &token)
         .await?;
