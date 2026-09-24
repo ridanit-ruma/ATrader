@@ -3,3 +3,4 @@ pub mod venue;
 pub mod sim;
 pub mod ledger;
 pub mod broker;
+pub mod store;
