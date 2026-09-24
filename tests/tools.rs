@@ -298,3 +298,13 @@ async fn research_tools(pool: PgPool) {
     assert_eq!(code(&t.get_performance("bot".into(), "1y".into()).await.unwrap_err()), "InvalidParams");
     let _ = app;
 }
+
+#[sqlx::test]
+async fn fundamentals_need_their_keys(pool: PgPool) {
+    let (_, t) = rig(pool).await;
+    let e = t.get_financials("UPBIT:KRW-BTC".into()).await.unwrap_err();
+    assert_eq!(code(&e), "INVALID_REQUEST");
+    assert!(e.message.contains("stocks"), "{}", e.message);
+    assert_eq!(code(&t.list_filings("UPBIT:KRW-BTC".into(), None, None).await.unwrap_err()), "INVALID_REQUEST");
+    assert_eq!(code(&t.list_filings("UPBIT:KRW-BTC".into(), Some("yesterday".into()), None).await.unwrap_err()), "InvalidParams");
+}

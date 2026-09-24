@@ -441,3 +441,57 @@ pub struct PerformanceView {
     /// Traded value over average equity.
     pub turnover: Option<Decimal>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PeriodView {
+    /// `FY2025` or `2026Q2`.
+    pub period: String,
+    pub end: chrono::NaiveDate,
+    pub revenue: Option<Decimal>,
+    pub operating_income: Option<Decimal>,
+    pub net_income: Option<Decimal>,
+    pub eps: Option<Decimal>,
+    /// Total equity at period end.
+    pub equity: Option<Decimal>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FinancialsView {
+    pub id: String,
+    /// `DART` (KRX) or `SEC EDGAR` (US).
+    pub source: String,
+    /// Currency of every amount.
+    pub currency: String,
+    /// Newest first, up to 3 fiscal years.
+    pub annual: Vec<PeriodView>,
+    /// The latest quarter's own figures (not year-to-date).
+    pub latest_quarter: Option<PeriodView>,
+    pub shares_outstanding: Option<Decimal>,
+    /// `reported` (EDGAR diluted EPS) or `computed` (DART: net income / shares outstanding).
+    pub eps_basis: String,
+    /// Current simulated mid price used for the ratios.
+    pub price: Option<Decimal>,
+    /// Price / latest annual EPS; absent for losses.
+    pub per: Option<Decimal>,
+    /// Price / (latest annual equity / shares).
+    pub pbr: Option<Decimal>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FilingView {
+    /// Pass to `get_filing`.
+    pub filing_id: String,
+    pub title: String,
+    pub form: String,
+    pub date: chrono::NaiveDate,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FilingText {
+    pub filing_id: String,
+    pub page: u32,
+    pub pages: u32,
+    /// Plain text, up to 20,000 characters.
+    pub text: String,
+}

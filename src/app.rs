@@ -19,14 +19,22 @@ pub struct App {
     pub market: Market,
     pub fx: FxCache,
     pub fx_spread: Decimal,
+    pub dart: Option<crate::fundamentals::dart::DartClient>,
+    pub edgar: Option<crate::fundamentals::edgar::EdgarClient>,
     accounts: RwLock<HashMap<String, AccountRow>>,
 }
 
 impl App {
     pub async fn new(broker: Arc<SimBroker>, store: Arc<Store>, market: Market, fx: FxCache) -> anyhow::Result<Self> {
-        let app = App { broker, store, market, fx, fx_spread: dec!(0.001), accounts: RwLock::new(HashMap::new()) };
+        let app = App { broker, store, market, fx, fx_spread: dec!(0.001), dart: None, edgar: None, accounts: RwLock::new(HashMap::new()) };
         app.reload_accounts().await?;
         Ok(app)
+    }
+
+    pub fn with_fundamentals(mut self, dart: Option<crate::fundamentals::dart::DartClient>, edgar: Option<crate::fundamentals::edgar::EdgarClient>) -> Self {
+        self.dart = dart;
+        self.edgar = edgar;
+        self
     }
 
     pub async fn reload_accounts(&self) -> anyhow::Result<()> {

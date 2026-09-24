@@ -101,3 +101,16 @@ async fn crypto_candles_and_screens_live() {
     assert_eq!(binance.candles(&"BINANCE:BTCUSDT".parse().unwrap(), Interval::D1, 3).await.unwrap().len(), 3);
     assert_eq!(binance.screen(Ranking::Gainers, 5).await.unwrap().len(), 5);
 }
+
+#[tokio::test]
+#[ignore]
+async fn edgar_live() {
+    let c = atrader::fundamentals::edgar::EdgarClient::new("ATrader test contact@example.com".into());
+    let f = c.fundamentals("AAPL").await.unwrap();
+    assert!(f.annual[0].revenue.unwrap() > rust_decimal::Decimal::from(100_000_000_000u64));
+    let filings = c.filings("AAPL", None, 5).await.unwrap();
+    assert_eq!(filings.len(), 5);
+    let q = c.filings("AAPL", None, 50).await.unwrap().into_iter().find(|f| f.form == "10-Q").unwrap();
+    let text = c.filing_text("AAPL", &q.id).await.unwrap();
+    assert!(text.len() > 10_000 && text.contains("Apple"), "{}", &text[..200.min(text.len())]);
+}

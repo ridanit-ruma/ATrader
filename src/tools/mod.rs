@@ -97,6 +97,19 @@ pub trait Trader {
     /// Account performance over `period`: 1d, 1w, 1m, 3m or all — return, max drawdown,
     /// volatility, Sharpe, win rate, realized profit, fees and turnover (KRW).
     async fn get_performance(&self, account: String, period: String) -> zyris::Result<PerformanceView>;
+
+    /// Company financials: up to 3 fiscal years and the latest quarter (revenue, operating and
+    /// net income, EPS, equity), shares outstanding, and PER/PBR at the current price. KRX
+    /// (DART) and US (SEC EDGAR) stocks only.
+    async fn get_financials(&self, id: String) -> zyris::Result<FinancialsView>;
+
+    /// Recent disclosures and filings, newest first. `since` is YYYY-MM-DD (default: 90 days
+    /// ago); `limit` default 20, at most 100.
+    async fn list_filings(&self, id: String, since: Option<String>, limit: Option<u32>) -> zyris::Result<Vec<FilingView>>;
+
+    /// A filing's text, 20,000 characters per page (`page` from 1; the answer says how many
+    /// pages exist).
+    async fn get_filing(&self, id: String, filing_id: String, page: Option<u32>) -> zyris::Result<FilingText>;
 }
 
 pub struct TraderTools {
@@ -152,6 +165,14 @@ fn feed_error(e: anyhow::Error) -> zyris::Error {
         Some(rest) => order_error(OrderError::InvalidRequest(rest.to_string())),
         None => upstream(msg),
     }
+}
+
+fn not_enabled(what: &str) -> zyris::Error {
+    order_error(OrderError::InvalidRequest(what.to_string()))
+}
+
+fn period_view(p: &crate::fundamentals::PeriodFinancials) -> PeriodView {
+    PeriodView { period: p.label.clone(), end: p.end, revenue: p.revenue, operating_income: p.operating_income, net_income: p.net_income, eps: p.eps, equity: p.equity }
 }
 
 fn parse_id(s: &str) -> Result<InstrumentId, zyris::Error> {
@@ -518,5 +539,71 @@ impl Trader for TraderTools {
             fees_krw: p.fees_krw,
             turnover: p.turnover,
         })
+    }
+
+    async fn get_financials(&self, id: String) -> zyris::Result<FinancialsView> {
+        let id = self.known(&id)?;
+        let today = self.app.broker.now().date_naive();
+        let (source, f) = match id.venue {
+            Venue::Krx => {
+                let dart = self.app.dart.as_ref().ok_or_else(|| not_enabled("KRX financials need DART_API_KEY on the server"))?;
+                ("DART", dart.fundamentals(&id.symbol, today).await.map_err(|e| upstream(format!("{e:#}")))?)
+            }
+            Venue::Us => {
+                let edgar = self.app.edgar.as_ref().ok_or_else(|| not_enabled("US financials need EDGAR_USER_AGENT on the server"))?;
+                ("SEC EDGAR", edgar.fundamentals(&id.symbol).await.map_err(|e| upstream(format!("{e:#}")))?)
+            }
+            _ => return Err(not_enabled("financials exist for KRX and US stocks only")),
+        };
+        let _ = self.app.market.ensure_fresh(&id).await;
+        let price = self.app.broker.book_view(&id, 1).and_then(|v| mid(&v.shadow_bids, &v.shadow_asks));
+        let r = price.map(|p| crate::fundamentals::ratios(p, &f));
+        Ok(FinancialsView {
+            id: id.to_string(),
+            source: source.into(),
+            currency: f.currency.code().into(),
+            annual: f.annual.iter().map(period_view).collect(),
+            latest_quarter: f.latest_quarter.as_ref().map(period_view),
+            shares_outstanding: f.shares_outstanding,
+            eps_basis: if f.eps_computed { "computed" } else { "reported" }.into(),
+            price,
+            per: r.and_then(|r| r.per),
+            pbr: r.and_then(|r| r.pbr),
+        })
+    }
+
+    async fn list_filings(&self, id: String, since: Option<String>, limit: Option<u32>) -> zyris::Result<Vec<FilingView>> {
+        let id = self.known(&id)?;
+        let since = match since {
+            Some(s) => chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").map_err(|_| bad("since must be YYYY-MM-DD"))?,
+            None => self.app.broker.now().date_naive() - chrono::Duration::days(90),
+        };
+        let limit = limit.unwrap_or(20).clamp(1, 100) as usize;
+        let filings = match id.venue {
+            Venue::Krx => {
+                let dart = self.app.dart.as_ref().ok_or_else(|| not_enabled("KRX filings need DART_API_KEY on the server"))?;
+                dart.filings(&id.symbol, since, limit).await
+            }
+            Venue::Us => {
+                let edgar = self.app.edgar.as_ref().ok_or_else(|| not_enabled("US filings need EDGAR_USER_AGENT on the server"))?;
+                edgar.filings(&id.symbol, Some(since), limit).await
+            }
+            _ => return Err(not_enabled("filings exist for KRX and US stocks only")),
+        }
+        .map_err(|e| upstream(format!("{e:#}")))?;
+        Ok(filings.into_iter().map(|f| FilingView { filing_id: f.id, title: f.title, form: f.form, date: f.date, url: f.url }).collect())
+    }
+
+    async fn get_filing(&self, id: String, filing_id: String, page: Option<u32>) -> zyris::Result<FilingText> {
+        let id = self.known(&id)?;
+        let text = match id.venue {
+            Venue::Krx => self.app.dart.as_ref().ok_or_else(|| not_enabled("KRX filings need DART_API_KEY on the server"))?.filing_text(filing_id.trim()).await,
+            Venue::Us => self.app.edgar.as_ref().ok_or_else(|| not_enabled("US filings need EDGAR_USER_AGENT on the server"))?.filing_text(&id.symbol, filing_id.trim()).await,
+            _ => return Err(not_enabled("filings exist for KRX and US stocks only")),
+        }
+        .map_err(|e| upstream(format!("{e:#}")))?;
+        let page = page.unwrap_or(1);
+        let (chunk, pages) = crate::fundamentals::page_text(&text, page as usize).map_err(bad)?;
+        Ok(FilingText { filing_id, page, pages: pages as u32, text: chunk })
     }
 }

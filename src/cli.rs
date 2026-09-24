@@ -37,6 +37,8 @@ ENVIRONMENT:
   KIS_APP_KEY, KIS_APP_SECRET  KIS Open API keys (enable KRX and US stocks)
   KIS_ENV               `mock` for KIS mock-trading hosts (default: real)
   ATRADER_STATE_DIR     where the KIS token is cached (default: ~/.local/state/atrader)
+  DART_API_KEY          OpenDART key (KRX financials and filings)
+  EDGAR_USER_AGENT      name and contact email for SEC EDGAR (US financials and filings)
   RUST_LOG              log filter (default: atrader=info,zyris_core=info)";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -205,7 +207,10 @@ async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
     tokio::spawn(pump(events_rx, broker.clone(), bus.clone()));
     let writer = tokio::spawn(persist(journal_rx, store.clone(), bus.clone(), generations.clone()));
     tokio::spawn(crate::app::bar_loop(bus.subscribe(), store.clone()));
-    let app = Arc::new(App::new(broker.clone(), store, market, FxCache::new()).await?);
+    let dart = std::env::var("DART_API_KEY").ok().filter(|k| !k.trim().is_empty()).map(|k| crate::fundamentals::dart::DartClient::new(k.trim().into()));
+    let edgar = std::env::var("EDGAR_USER_AGENT").ok().filter(|u| !u.trim().is_empty()).map(|u| crate::fundamentals::edgar::EdgarClient::new(u.trim().into()));
+    tracing::info!(dart = dart.is_some(), edgar = edgar.is_some(), "fundamentals sources");
+    let app = Arc::new(App::new(broker.clone(), store, market, FxCache::new()).await?.with_fundamentals(dart, edgar));
     app.market.refresh_pins();
     tokio::spawn(crate::app::snapshot_loop(app.clone(), generations));
 

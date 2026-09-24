@@ -53,6 +53,10 @@ ZYRIS_CREDENTIAL=zc_... atrader serve
 atrader serve --no-zyris
 ```
 
+Fundamentals are optional: set `DART_API_KEY` (free, issued at opendart.fss.or.kr) for Korean
+companies and `EDGAR_USER_AGENT` (for example `"ATrader you@example.com"`, as SEC requires) for US
+companies. KIS keys (`KIS_APP_KEY`, `KIS_APP_SECRET`) enable Korean and US stock quotes.
+
 `atrader account reset <id>` starts an account over and keeps its history. Stop `atrader serve`
 before a reset: a running server keeps trading the old state in memory.
 
