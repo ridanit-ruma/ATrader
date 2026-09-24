@@ -60,13 +60,20 @@ impl Market {
         rx
     }
 
-    /// Load every feed's instrument list into the broker. Returns how many were offered.
+    /// Load every feed's instrument list into the broker. A venue whose list cannot be loaded
+    /// is logged and skipped so the others still trade. Returns how many were offered.
+    // ponytail: a skipped venue stays empty until restart; retry on a timer if outages prove common.
     pub async fn load_instruments(&self) -> anyhow::Result<usize> {
         let mut n = 0;
         for vf in self.venues.values() {
-            for i in vf.feed.instruments().await? {
-                self.broker.add_instrument(i);
-                n += 1;
+            match vf.feed.instruments().await {
+                Ok(list) => {
+                    for i in list {
+                        self.broker.add_instrument(i);
+                        n += 1;
+                    }
+                }
+                Err(e) => tracing::error!(venue = vf.feed.venue().tag(), error = %e, "could not load instruments; venue disabled until restart"),
             }
         }
         Ok(n)
@@ -223,6 +230,34 @@ mod tests {
         assert!(r.market.ensure_fresh(&"UPBIT:KRW-NOPE".parse().unwrap()).await.is_err());
         assert!(r.subs.borrow().is_empty());
         assert_eq!(r.feed.snaps.load(Ordering::SeqCst), 0);
+    }
+
+    struct Down;
+
+    #[async_trait]
+    impl MarketFeed for Down {
+        fn venue(&self) -> Venue {
+            Venue::Krx
+        }
+        async fn instruments(&self) -> anyhow::Result<Vec<Instrument>> {
+            anyhow::bail!("master download failed")
+        }
+        async fn snapshot(&self, _: &InstrumentId) -> anyhow::Result<Book> {
+            anyhow::bail!("down")
+        }
+        async fn daily_stats(&self, _: &InstrumentId) -> anyhow::Result<DailyStats> {
+            anyhow::bail!("down")
+        }
+        async fn stream(&self, _: &[InstrumentId], _: &mpsc::Sender<MarketEvent>) -> anyhow::Result<()> {
+            anyhow::bail!("down")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_venue_does_not_block_the_others() {
+        let mut r = rig().await;
+        let _ = r.market.add_feed(Arc::new(Down), 10);
+        assert_eq!(r.market.load_instruments().await.unwrap(), 1);
     }
 
     #[tokio::test]

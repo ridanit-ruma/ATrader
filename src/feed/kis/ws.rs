@@ -76,14 +76,16 @@ fn from_symb(rec: &[String]) -> &[String] {
 pub fn record_event(tr_id: &str, rec: &[String], now: DateTime<Utc>) -> Option<MarketEvent> {
     let id = |venue, symbol: &str| InstrumentId { venue, symbol: symbol.trim().to_string() };
     match tr_id {
-        KRX_BOOK if rec.len() >= 43 => Some(MarketEvent::Book(Book {
+        // Field 2 is the hour class: "0" is the regular session; others are auction or
+        // after-hours expected books, which never trade at the prices they show.
+        KRX_BOOK if rec.len() >= 43 && rec[2].trim() == "0" => Some(MarketEvent::Book(Book {
             instrument: id(Venue::Krx, &rec[0]),
             asks: levels(&rec[3..13], &rec[23..33])?,
             bids: levels(&rec[13..23], &rec[33..43])?,
             prev_close: None,
             received_at: now,
         })),
-        KRX_TRADE if rec.len() >= 13 => Some(MarketEvent::Trade(Trade {
+        KRX_TRADE if rec.len() >= 13 && rec.get(43).is_none_or(|h| h.trim() == "0") => Some(MarketEvent::Trade(Trade {
             instrument: id(Venue::Krx, &rec[0]),
             price: num(&rec[2])?,
             qty: num(&rec[12])?,
@@ -234,5 +236,18 @@ mod tests {
         assert_eq!(v["body"]["input"]["tr_id"], "H0STASP0");
         assert_eq!(v["body"]["input"]["tr_key"], "005930");
         assert_eq!(us_tr_key("NAS", "AAPL"), "DNASAAPL");
+    }
+
+    #[test]
+    fn only_regular_session_records_become_events() {
+        let mut book = krx_book_record("005930");
+        book[2] = "A".into(); // closing-auction expected book
+        assert_eq!(record_event(KRX_BOOK, &book, now()), None);
+        let mut trade = vec!["0".to_string(); 46];
+        trade[0] = "005930".into();
+        trade[2] = "70100".into();
+        trade[12] = "1".into();
+        trade[43] = "1".into(); // not the regular session
+        assert_eq!(record_event(KRX_TRADE, &trade, now()), None);
     }
 }

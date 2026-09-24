@@ -80,13 +80,21 @@ pub fn state_dir() -> PathBuf {
 pub struct CachedToken {
     pub token: String,
     pub expires_at: DateTime<Utc>,
+    /// `fingerprint` of the appkey that issued it, so a rotated key never reuses it.
+    pub key: String,
+}
+
+/// A stable, non-reversible tag for an appkey (FNV-1a 64).
+pub fn fingerprint(app_key: &str) -> String {
+    let hash = app_key.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100000001b3));
+    format!("{hash:016x}")
 }
 
 impl CachedToken {
-    /// A cached token still good for at least 10 minutes.
-    pub fn load(path: &Path, now: DateTime<Utc>) -> Option<CachedToken> {
+    /// A cached token for this appkey still good for at least 10 minutes.
+    pub fn load(path: &Path, now: DateTime<Utc>, key: &str) -> Option<CachedToken> {
         let t: CachedToken = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
-        (t.expires_at - now > chrono::Duration::minutes(10)).then_some(t)
+        (t.key == key && t.expires_at - now > chrono::Duration::minutes(10)).then_some(t)
     }
 
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
@@ -101,7 +109,7 @@ impl CachedToken {
 }
 
 /// `access_token_token_expired` is KST wall time.
-pub fn parse_token_response(body: &Value) -> anyhow::Result<CachedToken> {
+pub fn parse_token_response(body: &Value, app_key: &str) -> anyhow::Result<CachedToken> {
     let token = body["access_token"].as_str().ok_or_else(|| anyhow!("token response without access_token"))?;
     let expiry = body["access_token_token_expired"].as_str().ok_or_else(|| anyhow!("token response without expiry"))?;
     let local = NaiveDateTime::parse_from_str(expiry, "%Y-%m-%d %H:%M:%S")?;
@@ -110,7 +118,24 @@ pub fn parse_token_response(body: &Value) -> anyhow::Result<CachedToken> {
         .single()
         .ok_or_else(|| anyhow!("ambiguous expiry {expiry}"))?
         .with_timezone(&Utc);
-    Ok(CachedToken { token: token.to_string(), expires_at })
+    Ok(CachedToken { token: token.to_string(), expires_at, key: fingerprint(app_key) })
+}
+
+/// The token was revoked or expired early (e.g. re-issued elsewhere).
+pub fn is_token_error(body: &Value) -> bool {
+    matches!(body["msg_cd"].as_str(), Some("EGW00121" | "EGW00123"))
+}
+
+/// KIS rolls the reference (previous close) price over before the session; values fetched
+/// earlier in the KST morning may still be yesterday's.
+pub fn prev_close_cacheable(now: DateTime<Utc>) -> bool {
+    let t = now.with_timezone(&chrono_tz::Asia::Seoul).time();
+    t >= chrono::NaiveTime::from_hms_opt(8, 30, 0).expect("valid time")
+}
+
+/// KIS PINGPONG frames are answered with a WebSocket pong carrying the same payload.
+pub fn ping_reply(raw: String) -> Message {
+    Message::Pong(raw.into_bytes().into())
 }
 
 /// KIS reports failures in the body: `rt_cd != "0"` with `msg_cd`/`msg1`.
@@ -157,7 +182,7 @@ impl KisClient {
         if let Some(t) = slot.as_ref().filter(|t| t.expires_at - now > chrono::Duration::minutes(10)) {
             return Ok(t.token.clone());
         }
-        if let Some(t) = CachedToken::load(&self.token_path(), now) {
+        if let Some(t) = CachedToken::load(&self.token_path(), now, &fingerprint(&self.cfg.app_key)) {
             *slot = Some(t.clone());
             return Ok(t.token);
         }
@@ -170,7 +195,7 @@ impl KisClient {
             .json()
             .await
             .context("KIS token response")?;
-        let t = parse_token_response(&body).map_err(|e| anyhow!("KIS token issuance failed: {e} ({})", body["error_description"].as_str().unwrap_or("")))?;
+        let t = parse_token_response(&body, &self.cfg.app_key).map_err(|e| anyhow!("KIS token issuance failed: {e} ({})", body["error_description"].as_str().unwrap_or("")))?;
         if let Err(e) = t.save(&self.token_path()) {
             tracing::warn!(error = %e, "could not cache the KIS token; the next start will issue another");
         }
@@ -223,6 +248,11 @@ impl KisClient {
             .json()
             .await
             .with_context(|| format!("KIS {tr_id} response"))?;
+        if is_token_error(&body) {
+            // Drop the dead token so the next call issues a fresh one.
+            self.token.lock().await.take();
+            let _ = std::fs::remove_file(self.token_path());
+        }
         check_rt(&body, tr_id)?;
         Ok(body)
     }
@@ -250,7 +280,7 @@ async fn stream_ws(
             _ => continue,
         };
         match ws::parse_frame(&text) {
-            Ok(ws::Frame::Ping(raw)) => ws.send(Message::text(raw)).await?,
+            Ok(ws::Frame::Ping(raw)) => ws.send(ping_reply(raw)).await?,
             Ok(ws::Frame::Ack { ok: false, tr_id, msg }) => tracing::warn!(%tr_id, %msg, "KIS subscription refused"),
             Ok(ws::Frame::Data { tr_id, records }) => {
                 for rec in records {
@@ -316,14 +346,19 @@ impl KisKrxFeed {
     }
 
     /// Today's previous close for `id`, fetched once per KST day.
-    async fn ensure_prev_close(&self, id: &InstrumentId) -> anyhow::Result<()> {
+    /// Today's previous close for `id`, fetched once per KST day (always when `force`). Values
+    /// fetched before the morning rollover are not cached.
+    async fn ensure_prev_close(&self, id: &InstrumentId, force: bool) -> anyhow::Result<()> {
         let fresh = self.prev_close.lock().unwrap().get(id).is_some_and(|(d, _)| *d == self.today());
-        if !fresh {
+        if force || !fresh {
             let body = self
                 .client
                 .get("/uapi/domestic-stock/v1/quotations/inquire-price", "FHKST01010100", &[("FID_COND_MRKT_DIV_CODE", "J"), ("FID_INPUT_ISCD", &id.symbol)])
                 .await?;
-            self.remember_prev_close(id, rest::krx_prev_close(&body)?);
+            let price = rest::krx_prev_close(&body)?;
+            if prev_close_cacheable(self.clock.now()) {
+                self.remember_prev_close(id, price);
+            }
         }
         Ok(())
     }
@@ -336,14 +371,14 @@ impl MarketFeed for KisKrxFeed {
     }
 
     async fn instruments(&self) -> anyhow::Result<Vec<Instrument>> {
-        let http = reqwest::Client::new();
+        let http = reqwest::Client::builder().timeout(StdDuration::from_secs(60)).build()?;
         let mut out = master::parse_krx_master(&download_master(&http, "kospi_code.mst").await?);
         out.extend(master::parse_krx_master(&download_master(&http, "kosdaq_code.mst").await?));
         Ok(out)
     }
 
     async fn snapshot(&self, id: &InstrumentId) -> anyhow::Result<Book> {
-        self.ensure_prev_close(id).await?;
+        self.ensure_prev_close(id, false).await?;
         let body = self
             .client
             .get(
@@ -382,7 +417,7 @@ impl MarketFeed for KisKrxFeed {
     async fn stream(&self, ids: &[InstrumentId], tx: &mpsc::Sender<MarketEvent>) -> anyhow::Result<()> {
         wait_for_session(&self.calendar, self.clock.as_ref(), Venue::Krx).await;
         for id in ids {
-            self.ensure_prev_close(id).await?;
+            self.ensure_prev_close(id, true).await?;
         }
         let subs: Vec<(&str, String)> =
             ids.iter().flat_map(|i| [(ws::KRX_BOOK, i.symbol.clone()), (ws::KRX_TRADE, i.symbol.clone())]).collect();
@@ -419,7 +454,7 @@ impl MarketFeed for KisUsFeed {
     }
 
     async fn instruments(&self) -> anyhow::Result<Vec<Instrument>> {
-        let http = reqwest::Client::new();
+        let http = reqwest::Client::builder().timeout(StdDuration::from_secs(60)).build()?;
         let mut out = Vec::new();
         let mut map = HashMap::new();
         for file in ["nasmst.cod", "nysmst.cod", "amsmst.cod"] {
@@ -481,9 +516,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kis_token.json");
         let now = Utc.with_ymd_and_hms(2026, 9, 24, 0, 0, 0).unwrap();
-        let t = CachedToken { token: "tok".into(), expires_at: now + chrono::Duration::hours(20) };
+        let t = CachedToken { token: "tok".into(), expires_at: now + chrono::Duration::hours(20), key: fingerprint("APPKEY123") };
         t.save(&path).unwrap();
-        assert_eq!(CachedToken::load(&path, now), Some(t));
+        assert_eq!(CachedToken::load(&path, now, &fingerprint("APPKEY123")), Some(t.clone()));
+        assert_eq!(CachedToken::load(&path, now, &fingerprint("OTHERKEY")), None); // rotated appkey
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
     }
@@ -493,17 +529,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kis_token.json");
         let now = Utc.with_ymd_and_hms(2026, 9, 24, 0, 0, 0).unwrap();
-        CachedToken { token: "tok".into(), expires_at: now + chrono::Duration::minutes(5) }.save(&path).unwrap();
-        assert_eq!(CachedToken::load(&path, now), None);
+        CachedToken { token: "tok".into(), expires_at: now + chrono::Duration::minutes(5), key: fingerprint("k") }.save(&path).unwrap();
+        assert_eq!(CachedToken::load(&path, now, &fingerprint("k")), None);
         std::fs::write(&path, "{").unwrap();
-        assert_eq!(CachedToken::load(&path, now), None);
-        assert_eq!(CachedToken::load(&dir.path().join("missing"), now), None);
+        assert_eq!(CachedToken::load(&path, now, &fingerprint("k")), None);
+        assert_eq!(CachedToken::load(&dir.path().join("missing"), now, &fingerprint("k")), None);
     }
 
     #[test]
     fn parses_token_response_expiry_in_kst() {
         let body = serde_json::json!({"access_token": "abc", "token_type": "Bearer", "expires_in": 86400, "access_token_token_expired": "2026-09-25 09:00:00"});
-        let t = parse_token_response(&body).unwrap();
+        let t = parse_token_response(&body, "k").unwrap();
         assert_eq!(t.token, "abc");
         assert_eq!(t.expires_at, Utc.with_ymd_and_hms(2026, 9, 25, 0, 0, 0).unwrap());
     }
@@ -539,5 +575,26 @@ mod tests {
         let mut book = Book { instrument: id, bids: vec![], asks: vec![], prev_close: None, received_at: Utc::now() };
         feed.attach_prev_close(&mut book);
         assert_eq!(book.prev_close, Some(rust_decimal_macros::dec!(69800)));
+    }
+
+    #[test]
+    fn invalid_token_codes_are_recognised() {
+        assert!(is_token_error(&serde_json::json!({"rt_cd": "1", "msg_cd": "EGW00123", "msg1": "기간이 만료된 token 입니다."})));
+        assert!(is_token_error(&serde_json::json!({"rt_cd": "1", "msg_cd": "EGW00121"})));
+        assert!(!is_token_error(&serde_json::json!({"rt_cd": "1", "msg_cd": "EGW00201"})));
+    }
+
+    #[test]
+    fn prev_close_is_cached_only_after_the_morning_rollover() {
+        let kst = |h, m| chrono_tz::Asia::Seoul.with_ymd_and_hms(2026, 9, 23, h, m, 0).unwrap().with_timezone(&Utc);
+        assert!(!prev_close_cacheable(kst(0, 30)));
+        assert!(!prev_close_cacheable(kst(8, 29)));
+        assert!(prev_close_cacheable(kst(8, 30)));
+        assert!(prev_close_cacheable(kst(15, 0)));
+    }
+
+    #[test]
+    fn pingpong_is_answered_with_a_pong_frame() {
+        assert_eq!(ping_reply("{\"header\":{\"tr_id\":\"PINGPONG\"}}".into()), Message::Pong("{\"header\":{\"tr_id\":\"PINGPONG\"}}".as_bytes().to_vec().into()));
     }
 }
