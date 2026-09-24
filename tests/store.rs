@@ -1,7 +1,7 @@
 use atrader::broker::*;
 use atrader::domain::*;
 use atrader::sim::Size;
-use atrader::store::Store;
+use atrader::store::{AccountRow, Store};
 use chrono::Utc;
 use rust_decimal_macros::dec;
 use sqlx::PgPool;
@@ -103,4 +103,44 @@ async fn conversions_survive_replay(pool: PgPool) {
     assert_eq!((cash[&Currency::Krw], cash[&Currency::Usd]), (dec!(634650), dec!(999)));
     let pf = store.load_portfolio("a", 1).await.unwrap();
     assert_eq!((pf.cash(Currency::Krw), pf.cash(Currency::Usd)), (dec!(634650), dec!(999)));
+}
+
+fn micros() -> chrono::DateTime<Utc> {
+    use chrono::SubsecRound;
+    Utc::now().trunc_subsecs(6)
+}
+
+#[sqlx::test]
+async fn orders_and_fills_round_trip(pool: PgPool) {
+    let store = Store::new(pool);
+    store.create_account("a", "Test", Some("agent-1"), &[(Currency::Krw, dec!(1000000))], Utc::now()).await.unwrap();
+    store.create_account("b", "Manual", None, &[(Currency::Krw, dec!(1))], Utc::now()).await.unwrap();
+    assert_eq!(
+        store.list_accounts().await.unwrap(),
+        vec![
+            AccountRow { id: "a".into(), name: "Test".into(), agent_id: Some("agent-1".into()), generation: 1 },
+            AccountRow { id: "b".into(), name: "Manual".into(), agent_id: None, generation: 1 },
+        ]
+    );
+
+    let mut filled = order(1);
+    filled.created_at = micros();
+    let mut open = order(2);
+    open.req.kind = OrderType::Limit;
+    open.req.limit_price = Some(dec!(69000));
+    open.req.tif = Tif::Day;
+    open.status = OrderStatus::Open;
+    open.filled_qty = dec!(0);
+    open.filled_notional = dec!(0);
+    open.created_at = micros();
+    store.save_order(&filled, 1).await.unwrap();
+    store.save_order(&open, 1).await.unwrap();
+    assert_eq!(store.orders("a", 1, true, 10).await.unwrap(), vec![open.clone()]);
+    assert_eq!(store.orders("a", 1, false, 10).await.unwrap(), vec![open, filled]);
+
+    let mut f = fill(1, Side::Buy, dec!(10), dec!(700000), dec!(105), dec!(0));
+    f.at = micros();
+    store.save_fill(&f, 1).await.unwrap();
+    assert_eq!(store.fills("a", 1, None, 10).await.unwrap(), vec![f.clone()]);
+    assert!(store.fills("a", 1, Some(f.at + chrono::Duration::seconds(1)), 10).await.unwrap().is_empty());
 }

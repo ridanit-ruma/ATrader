@@ -7,10 +7,88 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
-use crate::broker::{Conversion, Fill, Order};
+use crate::broker::{Conversion, Fill, Liquidity, Order, OrderRequest, OrderStatus, OrderType, Tif};
 use crate::domain::{Currency, InstrumentId, Side};
 use crate::ledger::Portfolio;
 use crate::sim::Size;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccountRow {
+    pub id: String,
+    pub name: String,
+    /// The Attacca agent that trades this account; `None` hides it from tools.
+    pub agent_id: Option<String>,
+    pub generation: i32,
+}
+
+fn parse_order(r: &sqlx::postgres::PgRow) -> sqlx::Result<Order> {
+    let text = |col: &str| -> String { r.get(col) };
+    let bad = |col: &str, v: String| decode_err(format!("unknown {col} {v:?}"));
+    let side = Side::from_code(&text("side")).ok_or_else(|| bad("side", text("side")))?;
+    let kind = match text("kind").as_str() {
+        "market" => OrderType::Market,
+        "limit" => OrderType::Limit,
+        v => return Err(bad("kind", v.into())),
+    };
+    let tif = match text("tif").as_str() {
+        "day" => Tif::Day,
+        "gtc" => Tif::Gtc,
+        "ioc" => Tif::Ioc,
+        v => return Err(bad("tif", v.into())),
+    };
+    let status = match text("status").as_str() {
+        "open" => OrderStatus::Open,
+        "filled" => OrderStatus::Filled,
+        "cancelled" => OrderStatus::Cancelled,
+        "expired" => OrderStatus::Expired,
+        v => return Err(bad("status", v.into())),
+    };
+    let size = match (r.get::<Option<Decimal>, _>("qty"), r.get::<Option<Decimal>, _>("notional")) {
+        (Some(q), _) => Size::Qty(q),
+        (None, Some(n)) => Size::Notional(n),
+        (None, None) => return Err(decode_err("order without qty or notional".into())),
+    };
+    Ok(Order {
+        id: r.get::<i64, _>("id") as u64,
+        account: text("account_id"),
+        req: OrderRequest {
+            instrument: text("instrument").parse().map_err(decode_err)?,
+            side,
+            kind,
+            size,
+            limit_price: r.get("limit_price"),
+            tif,
+            reason: text("reason"),
+        },
+        status,
+        filled_qty: r.get("filled_qty"),
+        filled_notional: r.get("filled_notional"),
+        created_at: r.get("created_at"),
+    })
+}
+
+fn parse_fill(r: &sqlx::postgres::PgRow) -> sqlx::Result<Fill> {
+    let side_code: String = r.get("side");
+    let liquidity = match r.get::<String, _>("liquidity").as_str() {
+        "taker" => Liquidity::Taker,
+        "maker" => Liquidity::Maker,
+        v => return Err(decode_err(format!("unknown liquidity {v:?}"))),
+    };
+    Ok(Fill {
+        order_id: r.get::<i64, _>("order_id") as u64,
+        account: r.get("account_id"),
+        instrument: r.get::<String, _>("instrument").parse().map_err(decode_err)?,
+        side: Side::from_code(&side_code).ok_or_else(|| decode_err(format!("unknown side {side_code}")))?,
+        qty: r.get("qty"),
+        notional: r.get("notional"),
+        price: r.get("price"),
+        fee: r.get("fee"),
+        tax: r.get("tax"),
+        realized_pnl: r.get("realized_pnl"),
+        liquidity,
+        at: r.get("at"),
+    })
+}
 
 pub struct Store {
     pool: PgPool,
@@ -198,6 +276,44 @@ impl Store {
             .await?;
         }
         tx.commit().await
+    }
+
+    pub async fn list_accounts(&self) -> sqlx::Result<Vec<AccountRow>> {
+        let rows = sqlx::query("SELECT id, name, agent_id, generation FROM accounts ORDER BY id").fetch_all(&self.pool).await?;
+        Ok(rows
+            .iter()
+            .map(|r| AccountRow { id: r.get("id"), name: r.get("name"), agent_id: r.get("agent_id"), generation: r.get("generation") })
+            .collect())
+    }
+
+    /// Newest first.
+    pub async fn orders(&self, account: &str, generation: i32, open_only: bool, limit: i64) -> sqlx::Result<Vec<Order>> {
+        let rows = sqlx::query(
+            "SELECT * FROM orders WHERE account_id = $1 AND generation = $2 AND (NOT $3 OR status = 'open')
+             ORDER BY id DESC LIMIT $4",
+        )
+        .bind(account)
+        .bind(generation)
+        .bind(open_only)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(parse_order).collect()
+    }
+
+    /// Newest first; `since` is exclusive.
+    pub async fn fills(&self, account: &str, generation: i32, since: Option<DateTime<Utc>>, limit: i64) -> sqlx::Result<Vec<Fill>> {
+        let rows = sqlx::query(
+            "SELECT * FROM fills WHERE account_id = $1 AND generation = $2 AND ($3::timestamptz IS NULL OR at > $3)
+             ORDER BY id DESC LIMIT $4",
+        )
+        .bind(account)
+        .bind(generation)
+        .bind(since)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(parse_fill).collect()
     }
 
     pub async fn cash_balances(&self, account: &str, generation: i32) -> sqlx::Result<HashMap<Currency, Decimal>> {
