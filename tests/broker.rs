@@ -387,14 +387,14 @@ fn conversions_that_lose_money_are_rejected() {
     assert_eq!(b.portfolio("a").unwrap(), before);
 }
 
-fn journaled() -> (SimBroker, ManualClock, tokio::sync::mpsc::UnboundedReceiver<Journal>) {
+fn journaled() -> (SimBroker, ManualClock, tokio::sync::mpsc::UnboundedReceiver<Stamped>) {
     let (b, clock) = setup();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     (b.with_journal(tx), clock, rx)
 }
 
-fn drain(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Journal>) -> Vec<Journal> {
-    std::iter::from_fn(|| rx.try_recv().ok()).collect()
+fn drain(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Stamped>) -> Vec<Journal> {
+    std::iter::from_fn(|| rx.try_recv().ok()).map(|s| s.event).collect()
 }
 
 #[test]
@@ -452,7 +452,7 @@ fn restored_orders_reserve_and_fill_again() {
     let (fresh, _) = setup();
     let mut unreserved = pf.clone();
     unreserved.reserved_cash.clear();
-    fresh.restore_account("a", unreserved);
+    fresh.restore_account("a", unreserved, 1);
     fresh.restore_order(order.clone()).unwrap();
     assert_eq!(fresh.portfolio("a").unwrap().available_cash(Currency::Krw), pf.available_cash(Currency::Krw));
     let f = fresh.on_trade(trade(&clock, btc(), dec!(99990000), dec!(1)));
@@ -470,4 +470,21 @@ fn closing_the_journal_lets_the_writer_drain_and_stop() {
     b.place_sync("a", market_buy(dec!(0.1))).unwrap(); // after close: not journaled
     assert_eq!(drain(&mut rx).len(), 2);
     assert_eq!(rx.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Disconnected));
+}
+
+#[test]
+fn journal_entries_carry_the_generation_and_resets_start_clean() {
+    let (b, clock, mut rx) = journaled();
+    b.place_sync("a", market_buy(dec!(0.1))).unwrap();
+    let (resting, _) = b.place_sync("a", limit(btc(), Side::Buy, dec!(0.1), dec!(99000000), Tif::Gtc)).unwrap();
+    assert!(std::iter::from_fn(|| rx.try_recv().ok()).all(|s| s.generation == 1));
+    b.reset_account("a", &[(Currency::Krw, dec!(5000000))], 2);
+    assert_eq!(b.generations()["a"], 2);
+    let pf = b.portfolio("a").unwrap();
+    assert_eq!((pf.cash(Currency::Krw), pf.available_cash(Currency::Krw)), (dec!(5000000), dec!(5000000)));
+    assert!(pf.positions.is_empty());
+    assert!(b.on_trade(trade(&clock, btc(), dec!(98000000), dec!(1))).is_empty()); // old resting order is gone
+    assert_eq!(b.order(resting.id).unwrap().status, OrderStatus::Cancelled);
+    b.place_sync("a", market_buy(dec!(0.01))).unwrap();
+    assert!(std::iter::from_fn(|| rx.try_recv().ok()).all(|s| s.generation == 2));
 }

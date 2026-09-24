@@ -78,6 +78,8 @@ impl Notifier for AttaccaNotifier {
 pub enum AlertCmd {
     Upsert(Alert),
     Remove(i64),
+    /// The account was reset: its alerts belong to the closed generation.
+    DropAccount(String),
 }
 
 /// The account line appended to every alert message.
@@ -127,10 +129,9 @@ pub async fn alert_loop(
     mut bus: broadcast::Receiver<BusEvent>,
     mut cmds: mpsc::UnboundedReceiver<AlertCmd>,
     notifier: Arc<dyn Notifier>,
-    generations: HashMap<String, i32>,
 ) {
     let mut watcher = Watcher::default();
-    match app.store.all_active_alerts(&generations).await {
+    match app.store.all_active_alerts(&app.broker.generations()).await {
         Ok(alerts) => alerts.into_iter().for_each(|a| watcher.upsert(a)),
         Err(e) => tracing::error!(error = %e, "could not load alerts"),
     }
@@ -145,6 +146,10 @@ pub async fn alert_loop(
                 match cmd {
                     Some(AlertCmd::Upsert(a)) => watcher.upsert(a),
                     Some(AlertCmd::Remove(id)) => watcher.remove(id),
+                    Some(AlertCmd::DropAccount(account)) => {
+                        let ids: Vec<i64> = watcher.alerts().iter().filter(|a| a.account == account).map(|a| a.id).collect();
+                        ids.into_iter().for_each(|id| watcher.remove(id));
+                    }
                     None => return,
                 }
                 app.market.set_extra_pins(watcher.instruments());

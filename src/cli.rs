@@ -201,21 +201,21 @@ async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
     }
     drop(events_tx);
     let instruments = market.load_instruments().await?;
-    let generations = restore(&store, &broker).await?;
+    let accounts = restore(&store, &broker).await?;
     let slot = crate::alerts::deliver::ConnSlot::default();
     let (alert_tx, alert_rx) = mpsc::unbounded_channel();
-    tracing::info!(instruments, accounts = generations.len(), "state restored");
+    tracing::info!(instruments, accounts, "state restored");
 
     tokio::spawn(pump(events_rx, broker.clone(), bus.clone()));
-    let writer = tokio::spawn(persist(journal_rx, store.clone(), bus.clone(), generations.clone()));
+    let writer = tokio::spawn(persist(journal_rx, store.clone(), bus.clone()));
     tokio::spawn(crate::app::bar_loop(bus.subscribe(), store.clone()));
     let dart = std::env::var("DART_API_KEY").ok().filter(|k| !k.trim().is_empty()).map(|k| crate::fundamentals::dart::DartClient::new(k.trim().into()));
     let edgar = std::env::var("EDGAR_USER_AGENT").ok().filter(|u| !u.trim().is_empty()).map(|u| crate::fundamentals::edgar::EdgarClient::new(u.trim().into()));
     tracing::info!(dart = dart.is_some(), edgar = edgar.is_some(), "fundamentals sources");
     let app = Arc::new(App::new(broker.clone(), store, market, FxCache::new()).await?.with_fundamentals(dart, edgar).with_alerts(alert_tx));
     app.market.refresh_pins();
-    tokio::spawn(crate::alerts::deliver::alert_loop(app.clone(), bus.subscribe(), alert_rx, Arc::new(crate::alerts::deliver::AttaccaNotifier::new(slot.clone())), generations.clone()));
-    tokio::spawn(crate::app::snapshot_loop(app.clone(), generations));
+    tokio::spawn(crate::alerts::deliver::alert_loop(app.clone(), bus.subscribe(), alert_rx, Arc::new(crate::alerts::deliver::AttaccaNotifier::new(slot.clone()))));
+    tokio::spawn(crate::app::snapshot_loop(app.clone()));
 
     let timers = app.clone();
     tokio::spawn(async move {

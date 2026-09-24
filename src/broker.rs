@@ -128,6 +128,13 @@ pub enum Journal {
     Conversion { account: AccountId, conversion: Conversion, at: DateTime<Utc> },
 }
 
+/// A journal event with the account generation it belongs to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stamped {
+    pub generation: i32,
+    pub event: Journal,
+}
+
 /// The shadow book next to the real one, for quotes and order-book tools.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BookView {
@@ -189,6 +196,7 @@ struct World {
     orders: HashMap<OrderId, Order>,
     resting: HashMap<InstrumentId, Vec<Resting>>,
     last_trades: HashMap<InstrumentId, (Decimal, DateTime<Utc>)>,
+    generations: HashMap<AccountId, i32>,
     next_order_id: OrderId,
 }
 
@@ -198,7 +206,7 @@ pub struct SimBroker {
     staleness: Duration,
     // ponytail: one global lock over the simulated world; per-instrument actors (spec §13) if order rate needs it.
     world: Mutex<World>,
-    journal: Mutex<Option<mpsc::UnboundedSender<Journal>>>,
+    journal: Mutex<Option<mpsc::UnboundedSender<Stamped>>>,
 }
 
 /// The result of validating an order against the current shadow book.
@@ -307,14 +315,20 @@ fn release(w: &mut World, order: &Order, qty: Decimal) {
 
 impl SimBroker {
     /// Send every persisted-state change to `tx` (see `Journal`).
-    pub fn with_journal(self, tx: mpsc::UnboundedSender<Journal>) -> Self {
+    pub fn with_journal(self, tx: mpsc::UnboundedSender<Stamped>) -> Self {
         *self.journal.lock().unwrap() = Some(tx);
         self
     }
 
-    fn emit(&self, j: Journal) {
+    fn emit(&self, w: &World, j: Journal) {
+        let account = match &j {
+            Journal::Order(o) => &o.account,
+            Journal::Fill(f) => &f.account,
+            Journal::Conversion { account, .. } => account,
+        };
+        let generation = w.generations.get(account).copied().unwrap_or(1);
         if let Some(tx) = &*self.journal.lock().unwrap() {
-            let _ = tx.send(j);
+            let _ = tx.send(Stamped { generation, event: j });
         }
     }
 
@@ -335,7 +349,7 @@ impl SimBroker {
         release(w, &order, remaining);
         order.status = status;
         w.orders.insert(order_id, order.clone());
-        self.emit(Journal::Order(order.clone()));
+        self.emit(w, Journal::Order(order.clone()));
         order
     }
 
@@ -370,7 +384,7 @@ impl SimBroker {
     }
 
     pub fn open_account(&self, id: &str, cash: &[(Currency, Decimal)]) {
-        self.world.lock().unwrap().accounts.insert(id.to_string(), Portfolio::new(cash));
+        self.restore_account(id, Portfolio::new(cash), 1);
     }
 
     pub fn portfolio(&self, id: &str) -> Option<Portfolio> {
@@ -431,8 +445,8 @@ impl SimBroker {
             if r.remaining.is_zero() {
                 order.status = OrderStatus::Filled;
             }
-            self.emit(Journal::Order(order.clone()));
-            self.emit(Journal::Fill(fill.clone()));
+            self.emit(w, Journal::Order(order.clone()));
+            self.emit(w, Journal::Fill(fill.clone()));
             fills.push(fill);
             w.orders.insert(r.order_id, order);
         }
@@ -479,8 +493,8 @@ impl SimBroker {
             if r.remaining.is_zero() {
                 order.status = OrderStatus::Filled;
             }
-            self.emit(Journal::Order(order.clone()));
-            self.emit(Journal::Fill(fill.clone()));
+            self.emit(w, Journal::Order(order.clone()));
+            self.emit(w, Journal::Fill(fill.clone()));
             fills.push(fill);
             w.orders.insert(r.order_id, order);
         }
@@ -588,7 +602,7 @@ impl SimBroker {
         *pf.cash.entry(from).or_default() -= amount;
         *pf.cash.entry(to).or_default() += credit;
         let c = Conversion { from, to, debit: amount, credit, rate: (krw_per(from) * net / krw_per(to)).round_dp(8) };
-        self.emit(Journal::Conversion { account: account.to_string(), conversion: c.clone(), at: self.clock.now() });
+        self.emit(&w, Journal::Conversion { account: account.to_string(), conversion: c.clone(), at: self.clock.now() });
         Ok(c)
     }
 
@@ -646,8 +660,32 @@ impl SimBroker {
     }
 
     /// Replace an account's portfolio with one rebuilt from the store.
-    pub fn restore_account(&self, id: &str, portfolio: Portfolio) {
-        self.world.lock().unwrap().accounts.insert(id.to_string(), portfolio);
+    pub fn restore_account(&self, id: &str, portfolio: Portfolio, generation: i32) {
+        let mut w = self.world.lock().unwrap();
+        w.accounts.insert(id.to_string(), portfolio);
+        w.generations.insert(id.to_string(), generation);
+    }
+
+    pub fn generations(&self) -> HashMap<AccountId, i32> {
+        self.world.lock().unwrap().generations.clone()
+    }
+
+    /// Start `id` over at `generation` with `cash`: its resting orders are dropped (not journaled —
+    /// they belong to the closed generation) and its portfolio replaced.
+    pub fn reset_account(&self, id: &str, cash: &[(Currency, Decimal)], generation: i32) {
+        let mut guard = self.world.lock().unwrap();
+        let w = &mut *guard;
+        let open: Vec<OrderId> = w.orders.values().filter(|o| o.account == id && o.status == OrderStatus::Open).map(|o| o.id).collect();
+        for oid in open {
+            if let Some(o) = w.orders.get_mut(&oid) {
+                o.status = OrderStatus::Cancelled;
+            }
+            for rest in w.resting.values_mut() {
+                rest.retain(|r| r.order_id != oid);
+            }
+        }
+        w.accounts.insert(id.to_string(), Portfolio::new(cash));
+        w.generations.insert(id.to_string(), generation);
     }
 
     /// Put a persisted open limit order back on the book, reserving what it still needs. Its
@@ -737,9 +775,9 @@ impl SimBroker {
             order.status = if is_complete(&order) { OrderStatus::Filled } else { OrderStatus::Cancelled };
         }
         w.orders.insert(id, order.clone());
-        self.emit(Journal::Order(order.clone()));
+        self.emit(w, Journal::Order(order.clone()));
         for f in &fills {
-            self.emit(Journal::Fill(f.clone()));
+            self.emit(w, Journal::Fill(f.clone()));
         }
         Ok((order, fills))
     }

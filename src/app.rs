@@ -43,6 +43,24 @@ impl App {
         self
     }
 
+    /// Create an account and make it tradable immediately.
+    pub async fn create_account(&self, id: &str, name: &str, agent: Option<&str>, cash: &[(Currency, Decimal)]) -> anyhow::Result<()> {
+        self.store.create_account(id, name, agent, cash, self.broker.now()).await?;
+        self.broker.restore_account(id, crate::ledger::Portfolio::new(cash), 1);
+        self.reload_accounts().await
+    }
+
+    /// Start an account over while serving. Returns the new generation.
+    pub async fn reset_account(&self, id: &str, cash: &[(Currency, Decimal)]) -> anyhow::Result<i32> {
+        let generation = self.store.reset_account(id, cash, self.broker.now()).await?;
+        self.broker.reset_account(id, cash, generation);
+        if let Some(tx) = &self.alerts {
+            let _ = tx.send(crate::alerts::deliver::AlertCmd::DropAccount(id.to_string()));
+        }
+        self.reload_accounts().await?;
+        Ok(generation)
+    }
+
     pub async fn reload_accounts(&self) -> anyhow::Result<()> {
         let rows = self.store.list_accounts().await?;
         *self.accounts.write().unwrap() = rows.into_iter().map(|r| (r.id.clone(), r)).collect();
@@ -73,12 +91,12 @@ pub fn krw_per(c: Currency, usd_krw: Decimal) -> Decimal {
     if c == Currency::Krw { Decimal::ONE } else { usd_krw }
 }
 
-/// Load every account's portfolio and open orders from the store into `broker`. Returns the
-/// generation each account was restored at; the journal writer must keep using these.
-pub async fn restore(store: &Store, broker: &SimBroker) -> anyhow::Result<HashMap<String, i32>> {
+/// Load every account's portfolio and open orders from the store into `broker`. Returns how many
+/// accounts were restored.
+pub async fn restore(store: &Store, broker: &SimBroker) -> anyhow::Result<usize> {
     let accounts = store.list_accounts().await?;
     for a in &accounts {
-        broker.restore_account(&a.id, store.load_portfolio(&a.id, a.generation).await?);
+        broker.restore_account(&a.id, store.load_portfolio(&a.id, a.generation).await?, a.generation);
         for o in store.orders(&a.id, a.generation, true, 100_000).await?.into_iter().rev() {
             let id = o.id;
             if let Err(e) = broker.restore_order(o) {
@@ -87,7 +105,7 @@ pub async fn restore(store: &Store, broker: &SimBroker) -> anyhow::Result<HashMa
         }
     }
     broker.set_next_order_id(store.max_order_id().await? + 1);
-    Ok(accounts.into_iter().map(|a| (a.id, a.generation)).collect())
+    Ok(accounts.len())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -130,7 +148,7 @@ pub fn value_account(broker: &SimBroker, pf: &crate::ledger::Portfolio, usd_krw:
 
 /// Every minute, record each account's equity; at the first tick of a KST day, also record a
 /// daily close stamped 00:00 KST.
-pub async fn snapshot_loop(app: Arc<App>, generations: HashMap<String, i32>) {
+pub async fn snapshot_loop(app: Arc<App>) {
     use crate::performance::{Snapshot, SnapshotKind};
     use chrono::TimeZone;
     let mut last_day = None;
@@ -144,7 +162,7 @@ pub async fn snapshot_loop(app: Arc<App>, generations: HashMap<String, i32>) {
             .then(|| chrono_tz::Asia::Seoul.from_local_datetime(&day.and_hms_opt(0, 0, 0).expect("midnight")).single())
             .flatten()
             .map(|t| t.with_timezone(&chrono::Utc));
-        for (account, generation) in &generations {
+        for (account, generation) in &app.broker.generations() {
             let Some(pf) = app.broker.portfolio(account) else { continue };
             let v = value_account(&app.broker, &pf, usd_krw);
             let mut snaps = vec![(now, SnapshotKind::Minute)];

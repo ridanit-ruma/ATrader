@@ -83,12 +83,12 @@ async fn rig(pool: PgPool) -> (Arc<App>, TraderTools) {
     store.create_account("manual", "Manual", None, &[(Currency::Krw, dec!(1000000000))], Utc::now()).await.unwrap();
     let (jtx, jrx) = mpsc::unbounded_channel();
     let broker = Arc::new(SimBroker::new(Arc::new(clock.clone()), Calendar::default()).with_journal(jtx));
-    let generations = restore(&store, &broker).await.unwrap();
+    restore(&store, &broker).await.unwrap();
     let (bus, _) = broadcast::channel(64);
     let mut market = Market::new(broker.clone());
     let _subs = market.add_feed(Arc::new(Fake { clock }), 10);
     market.load_instruments().await.unwrap();
-    tokio::spawn(persist(jrx, store.clone(), bus, generations));
+    tokio::spawn(persist(jrx, store.clone(), bus));
     let app = Arc::new(App::new(broker, store, market, FxCache::fixed(dec!(1400))).await.unwrap());
     (app.clone(), TraderTools::new(app))
 }
@@ -254,7 +254,7 @@ async fn restart_restores_cash_positions_and_open_orders(pool: PgPool) {
 
     let clock = ManualClock::new(Utc.with_ymd_and_hms(2026, 9, 23, 1, 0, 0).unwrap());
     let fresh = SimBroker::new(Arc::new(clock), Calendar::default());
-    assert_eq!(restore(&app.store, &fresh).await.unwrap().len(), 2);
+    assert_eq!(restore(&app.store, &fresh).await.unwrap(), 2);
     assert_eq!(fresh.portfolio("bot").unwrap(), before);
     assert_eq!(fresh.order(resting.id).unwrap().status, atrader::broker::OrderStatus::Open);
 }
@@ -332,8 +332,7 @@ async fn fired_alerts_reach_the_agent_once(pool: PgPool) {
     let (bus, _) = broadcast::channel(64);
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let rec = Arc::new(Recorder { sent: Default::default(), fail: Default::default() });
-    let gens = std::collections::HashMap::from([("bot".to_string(), 1)]);
-    tokio::spawn(alert_loop(app.clone(), bus.subscribe(), cmd_rx, rec.clone(), gens));
+    tokio::spawn(alert_loop(app.clone(), bus.subscribe(), cmd_rx, rec.clone()));
     let alert = Alert {
         id: 0,
         account: "bot".into(),
@@ -373,7 +372,7 @@ async fn failed_deliveries_are_recorded(pool: PgPool) {
     let (bus, _) = broadcast::channel(64);
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let rec = Arc::new(Recorder { sent: Default::default(), fail: std::sync::atomic::AtomicBool::new(true) });
-    tokio::spawn(alert_loop(app.clone(), bus.subscribe(), cmd_rx, rec, std::collections::HashMap::from([("bot".to_string(), 1)])));
+    tokio::spawn(alert_loop(app.clone(), bus.subscribe(), cmd_rx, rec));
     let alert = Alert { id: 0, account: "bot".into(), generation: 1, condition: Condition::OrderFilled { id: None }, note: "fills".into(), once: false, created_at: Utc::now(), last_fired_at: None };
     let id = app.store.create_alert(&alert).await.unwrap();
     cmd_tx.send(AlertCmd::Upsert(Alert { id, ..alert })).unwrap();
@@ -449,7 +448,7 @@ async fn simultaneous_alerts_share_one_new_session(pool: PgPool) {
     let (bus, _) = broadcast::channel(64);
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let rec = Arc::new(Recorder { sent: Default::default(), fail: Default::default() });
-    tokio::spawn(alert_loop(app.clone(), bus.subscribe(), cmd_rx, rec.clone(), std::collections::HashMap::from([("bot".to_string(), 1)])));
+    tokio::spawn(alert_loop(app.clone(), bus.subscribe(), cmd_rx, rec.clone()));
     for price in [dec!(99000000), dec!(99500000)] {
         let a = Alert { id: 0, account: "bot".into(), generation: 1, condition: Condition::PriceAbove { id: "UPBIT:KRW-BTC".parse().unwrap(), price }, note: "n".into(), once: true, created_at: Utc::now(), last_fired_at: None };
         let id = app.store.create_alert(&a).await.unwrap();
@@ -466,4 +465,25 @@ async fn simultaneous_alerts_share_one_new_session(pool: PgPool) {
     let sent = rec.sent.lock().unwrap().clone();
     assert_eq!(sent.len(), 2);
     assert_eq!(sent.iter().filter(|s| s.2.is_none()).count(), 1, "both deliveries created a session: {sent:?}");
+}
+
+#[sqlx::test]
+async fn accounts_are_created_and_reset_live(pool: PgPool) {
+    let (app, t) = rig(pool).await;
+    app.create_account("fresh", "Fresh", Some("agent-2"), &[(Currency::Krw, dec!(1000000))]).await.unwrap();
+    assert!(t.list_accounts().await.unwrap().iter().any(|a| a.id == "fresh"));
+    t.place_order(buy("fresh", Some(dec!(0.001)), "first")).await.unwrap();
+    let generation = app.reset_account("fresh", &[(Currency::Krw, dec!(2000000))]).await.unwrap();
+    assert_eq!(generation, 2);
+    let acct = t.get_account("fresh".into()).await.unwrap();
+    assert_eq!(acct.equity_krw, dec!(2000000));
+    t.place_order(buy("fresh", Some(dec!(0.001)), "second")).await.unwrap();
+    for _ in 0..100 {
+        if !app.store.fills("fresh", 2, None, 10).await.unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(app.store.fills("fresh", 1, None, 10).await.unwrap().len(), 1);
+    assert_eq!(app.store.fills("fresh", 2, None, 10).await.unwrap().len(), 1);
 }
