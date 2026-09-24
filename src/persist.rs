@@ -1,30 +1,23 @@
 //! Writes the broker's journal to Postgres in order, then republishes each event on the bus.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{broadcast, mpsc};
 
-use crate::broker::Journal;
+use crate::broker::{Journal, Stamped};
 use crate::market::BusEvent;
 use crate::store::Store;
 
 const ATTEMPTS: u32 = 10;
 
-/// `generations` is what each account was restored at: the in-memory state belongs to that
-/// generation even if the account is reset in the database meanwhile. Accounts created later are
-/// looked up once and cached.
-pub async fn persist(
-    mut rx: mpsc::UnboundedReceiver<Journal>,
-    store: Arc<Store>,
-    bus: broadcast::Sender<BusEvent>,
-    mut generations: HashMap<String, i32>,
-) {
-    while let Some(j) = rx.recv().await {
+/// Each entry is written to the generation the broker stamped it with, so a reset while events
+/// are queued cannot move them into the new generation.
+pub async fn persist(mut rx: mpsc::UnboundedReceiver<Stamped>, store: Arc<Store>, bus: broadcast::Sender<BusEvent>) {
+    while let Some(Stamped { generation, event: j }) = rx.recv().await {
         let mut delay = Duration::from_millis(200);
         for attempt in 1..=ATTEMPTS {
-            match write(&store, &mut generations, &j).await {
+            match write(&store, generation, &j).await {
                 Ok(()) => break,
                 Err(e) if is_permanent(&e) => {
                     tracing::error!(error = %e, event = ?j, "journal write violates a constraint; event dropped");
@@ -56,23 +49,14 @@ fn is_permanent(e: &anyhow::Error) -> bool {
         .is_some_and(|c| c.starts_with("23"))
 }
 
-async fn generation(store: &Store, cache: &mut HashMap<String, i32>, account: &str) -> anyhow::Result<i32> {
-    if let Some(g) = cache.get(account) {
-        return Ok(*g);
-    }
-    let g = store.generation(account).await?;
-    cache.insert(account.to_string(), g);
-    Ok(g)
-}
-
-async fn write(store: &Store, cache: &mut HashMap<String, i32>, j: &Journal) -> anyhow::Result<()> {
+async fn write(store: &Store, generation: i32, j: &Journal) -> anyhow::Result<()> {
     match j {
-        Journal::Order(o) => store.save_order(o, generation(store, cache, &o.account).await?).await?,
+        Journal::Order(o) => store.save_order(o, generation).await?,
         Journal::Fill(f) => {
-            store.save_fill(f, generation(store, cache, &f.account).await?).await?;
+            store.save_fill(f, generation).await?;
         }
         Journal::Conversion { account, conversion, at } => {
-            store.save_conversion(account, generation(store, cache, account).await?, conversion, *at).await?
+            store.save_conversion(account, generation, conversion, *at).await?
         }
     }
     Ok(())

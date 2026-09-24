@@ -61,6 +61,13 @@ impl Market {
         rx
     }
 
+    /// How many instruments each venue is subscribed to.
+    pub fn subscriptions(&self) -> Vec<(Venue, usize)> {
+        let mut v: Vec<(Venue, usize)> = self.venues.iter().map(|(venue, vf)| (*venue, vf.subs.current().len())).collect();
+        v.sort_by_key(|(venue, _)| venue.tag());
+        v
+    }
+
     pub fn feed(&self, venue: Venue) -> Option<Arc<dyn MarketFeed>> {
         self.venues.get(&venue).map(|v| v.feed.clone())
     }

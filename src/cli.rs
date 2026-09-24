@@ -27,6 +27,8 @@ USAGE:
   atrader account create <id> <name> [--agent <attacca-agent-id>] [--cash KRW=10000000]...
   atrader account list
   atrader account reset <id> [--cash KRW=10000000]...
+  atrader user create <username>
+  atrader user reset-2fa <username>
 
 ENVIRONMENT:
   DATABASE_URL          Postgres connection string (required)
@@ -39,6 +41,7 @@ ENVIRONMENT:
   ATRADER_STATE_DIR     where the KIS token is cached (default: ~/.local/state/atrader)
   DART_API_KEY          OpenDART key (KRX financials and filings)
   EDGAR_USER_AGENT      name and contact email for SEC EDGAR (US financials and filings)
+  ATRADER_HTTP_ADDR     dashboard listen address (default: 127.0.0.1:8750)
   RUST_LOG              log filter (default: atrader=info,zyris_core=info)";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -47,6 +50,8 @@ pub enum Command {
     AccountCreate { id: String, name: String, agent: Option<String>, cash: Vec<(Currency, Decimal)> },
     AccountList,
     AccountReset { id: String, cash: Vec<(Currency, Decimal)> },
+    UserCreate { username: String },
+    UserReset2fa { username: String },
     Version,
     Help,
 }
@@ -92,6 +97,8 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             let (agent, cash) = parse_flags(&args[4..])?;
             Ok(Command::AccountCreate { id: id.to_string(), name: name.to_string(), agent, cash })
         }
+        ["user", "create", name] => Ok(Command::UserCreate { username: name.to_string() }),
+        ["user", "reset-2fa", name] => Ok(Command::UserReset2fa { username: name.to_string() }),
         ["account", "reset", id, ..] => {
             let (agent, cash) = parse_flags(&args[3..])?;
             if agent.is_some() {
@@ -143,6 +150,25 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
                         cash.join(" ")
                     );
                 }
+            }
+            Command::UserCreate { username } => {
+                let pw = rpassword::prompt_password("password (12+ characters): ")?;
+                if pw.chars().count() < 12 {
+                    anyhow::bail!("the password must be at least 12 characters");
+                }
+                if rpassword::prompt_password("again: ")? != pw {
+                    anyhow::bail!("the passwords differ");
+                }
+                crate::web::auth::AuthStore(store.pool().clone()).create_user(&username, &crate::web::auth::hash_password(&pw)).await?;
+                println!("created user {username}; log in to the dashboard to enrol two-factor authentication");
+            }
+            Command::UserReset2fa { username } => {
+                let auth = crate::web::auth::AuthStore(store.pool().clone());
+                let user = auth.user_by_name(&username).await?.ok_or_else(|| anyhow!("no user {username}"))?;
+                auth.set_totp(user.id, None, false).await?;
+                auth.save_recovery_codes(user.id, &[]).await?;
+                auth.delete_user_sessions(user.id).await?;
+                println!("two-factor authentication cleared for {username}; it is enrolled again at the next login");
             }
             Command::AccountReset { id, cash } => {
                 // A running server keeps trading the old generation in memory; stop it first.
@@ -201,21 +227,30 @@ async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
     }
     drop(events_tx);
     let instruments = market.load_instruments().await?;
-    let generations = restore(&store, &broker).await?;
+    let accounts = restore(&store, &broker).await?;
     let slot = crate::alerts::deliver::ConnSlot::default();
     let (alert_tx, alert_rx) = mpsc::unbounded_channel();
-    tracing::info!(instruments, accounts = generations.len(), "state restored");
+    tracing::info!(instruments, accounts, "state restored");
 
     tokio::spawn(pump(events_rx, broker.clone(), bus.clone()));
-    let writer = tokio::spawn(persist(journal_rx, store.clone(), bus.clone(), generations.clone()));
+    let writer = tokio::spawn(persist(journal_rx, store.clone(), bus.clone()));
     tokio::spawn(crate::app::bar_loop(bus.subscribe(), store.clone()));
     let dart = std::env::var("DART_API_KEY").ok().filter(|k| !k.trim().is_empty()).map(|k| crate::fundamentals::dart::DartClient::new(k.trim().into()));
     let edgar = std::env::var("EDGAR_USER_AGENT").ok().filter(|u| !u.trim().is_empty()).map(|u| crate::fundamentals::edgar::EdgarClient::new(u.trim().into()));
     tracing::info!(dart = dart.is_some(), edgar = edgar.is_some(), "fundamentals sources");
     let app = Arc::new(App::new(broker.clone(), store, market, FxCache::new()).await?.with_fundamentals(dart, edgar).with_alerts(alert_tx));
     app.market.refresh_pins();
-    tokio::spawn(crate::alerts::deliver::alert_loop(app.clone(), bus.subscribe(), alert_rx, Arc::new(crate::alerts::deliver::AttaccaNotifier::new(slot.clone())), generations.clone()));
-    tokio::spawn(crate::app::snapshot_loop(app.clone(), generations));
+    tokio::spawn(crate::alerts::deliver::alert_loop(app.clone(), bus.subscribe(), alert_rx, Arc::new(crate::alerts::deliver::AttaccaNotifier::new(slot.clone()))));
+    tokio::spawn(crate::app::snapshot_loop(app.clone()));
+
+    let addr: std::net::SocketAddr = std::env::var("ATRADER_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:8750".into()).parse().context("ATRADER_HTTP_ADDR")?;
+    let web = crate::web::WebState::new(app.clone(), crate::web::auth::AuthStore(app.store.pool().clone()), true).with_bus(bus.clone());
+    let zyris_connected = web.zyris_connected.clone();
+    tokio::spawn(async move {
+        if let Err(e) = crate::web::serve_http(web, addr).await {
+            tracing::error!(error = %e, "dashboard stopped");
+        }
+    });
 
     let timers = app.clone();
     tokio::spawn(async move {
@@ -242,6 +277,8 @@ async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
             let slot = slot.clone();
             move |conn| {
                 let slot = slot.clone();
+                // ponytail: set once and never cleared; clear it on disconnect if the SDK grows a hook.
+                zyris_connected.store(true, std::sync::atomic::Ordering::Relaxed);
                 async move { slot.put(conn) }
             }
         })
@@ -312,6 +349,13 @@ mod tests {
         );
         assert_eq!(parse(&args(&[])), Ok(Command::Help));
         assert_eq!(parse(&args(&["--version"])), Ok(Command::Version));
+    }
+
+    #[test]
+    fn parses_user_commands() {
+        assert_eq!(parse(&args(&["user", "create", "ruma"])), Ok(Command::UserCreate { username: "ruma".into() }));
+        assert_eq!(parse(&args(&["user", "reset-2fa", "ruma"])), Ok(Command::UserReset2fa { username: "ruma".into() }));
+        assert!(parse(&args(&["user", "create"])).is_err());
     }
 
     #[test]

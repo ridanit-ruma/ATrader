@@ -149,6 +149,10 @@ async fn deposit(
 }
 
 impl Store {
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     pub fn new(pool: PgPool) -> Self {
         Store { pool }
     }

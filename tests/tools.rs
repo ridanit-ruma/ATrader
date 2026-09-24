@@ -2,17 +2,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use atrader::app::{App, restore};
+use atrader::app::restore;
 use atrader::broker::SimBroker;
 use atrader::domain::*;
-use atrader::feed::{MarketEvent, MarketFeed};
-use atrader::fx::FxCache;
-use atrader::market::Market;
-use atrader::persist::persist;
-use atrader::sim::DailyStats;
-use atrader::store::Store;
+use atrader::feed::MarketEvent;
 use atrader::tools::*;
-use atrader::venue::{Calendar, Instrument, LotRule, TickRule};
+use atrader::venue::Calendar;
 use chrono::{TimeZone, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -20,78 +15,9 @@ use sqlx::PgPool;
 use tokio::sync::{broadcast, mpsc};
 use zyris::ErrorCode;
 
-struct Fake {
-    clock: ManualClock,
-}
+mod common;
+use common::*;
 
-#[async_trait]
-impl MarketFeed for Fake {
-    fn venue(&self) -> Venue {
-        Venue::Upbit
-    }
-    async fn instruments(&self) -> anyhow::Result<Vec<Instrument>> {
-        Ok(vec![Instrument {
-            id: "UPBIT:KRW-BTC".parse().unwrap(),
-            name: "비트코인 (Bitcoin)".into(),
-            tick: TickRule::Upbit,
-            lot: LotRule { step: dec!(0.00000001), min_qty: dec!(0.00000001), min_notional: dec!(5000) },
-            tradable: true,
-        }])
-    }
-    async fn snapshot(&self, id: &InstrumentId) -> anyhow::Result<Book> {
-        Ok(Book {
-            instrument: id.clone(),
-            bids: vec![Level { price: dec!(99999000), qty: dec!(1) }],
-            asks: vec![Level { price: dec!(100000000), qty: dec!(1) }],
-            prev_close: None,
-            received_at: self.clock.now(),
-        })
-    }
-    async fn daily_stats(&self, _: &InstrumentId) -> anyhow::Result<DailyStats> {
-        Ok(DailyStats { sigma: 0.02, adv_notional: dec!(50000000000) })
-    }
-    async fn stream(&self, _: &[InstrumentId], _: &mpsc::Sender<MarketEvent>) -> anyhow::Result<()> {
-        anyhow::bail!("unused")
-    }
-    async fn candles(&self, _: &InstrumentId, interval: atrader::candles::Interval, limit: usize) -> anyhow::Result<Vec<atrader::candles::Candle>> {
-        let step = chrono::Duration::seconds(interval.secs());
-        let start = self.clock.now() - step * limit as i32;
-        Ok((0..limit)
-            .map(|i| {
-                let p = Decimal::from(100 + i as i64);
-                atrader::candles::Candle { start: start + step * i as i32, open: p, high: p + dec!(1), low: p - dec!(1), close: p, volume: dec!(1), value: p }
-            })
-            .collect())
-    }
-    async fn screen(&self, ranking: atrader::screen::Ranking, limit: usize) -> anyhow::Result<Vec<atrader::screen::ScreenRow>> {
-        let row = atrader::screen::ScreenRow {
-            id: "UPBIT:KRW-BTC".parse().unwrap(),
-            name: None,
-            price: dec!(100000000),
-            change_pct: dec!(1.5),
-            volume: dec!(10),
-            value: dec!(1000000000),
-        };
-        Ok(atrader::screen::rank(vec![row], ranking, limit))
-    }
-}
-
-async fn rig(pool: PgPool) -> (Arc<App>, TraderTools) {
-    let clock = ManualClock::new(Utc.with_ymd_and_hms(2026, 9, 23, 1, 0, 0).unwrap());
-    let store = Arc::new(Store::new(pool));
-    store.create_account("bot", "Bot", Some("agent-1"), &[(Currency::Krw, dec!(1000000000))], Utc::now()).await.unwrap();
-    store.create_account("manual", "Manual", None, &[(Currency::Krw, dec!(1000000000))], Utc::now()).await.unwrap();
-    let (jtx, jrx) = mpsc::unbounded_channel();
-    let broker = Arc::new(SimBroker::new(Arc::new(clock.clone()), Calendar::default()).with_journal(jtx));
-    let generations = restore(&store, &broker).await.unwrap();
-    let (bus, _) = broadcast::channel(64);
-    let mut market = Market::new(broker.clone());
-    let _subs = market.add_feed(Arc::new(Fake { clock }), 10);
-    market.load_instruments().await.unwrap();
-    tokio::spawn(persist(jrx, store.clone(), bus, generations));
-    let app = Arc::new(App::new(broker, store, market, FxCache::fixed(dec!(1400))).await.unwrap());
-    (app.clone(), TraderTools::new(app))
-}
 
 fn code(e: &zyris::Error) -> String {
     match &e.code {
@@ -254,7 +180,7 @@ async fn restart_restores_cash_positions_and_open_orders(pool: PgPool) {
 
     let clock = ManualClock::new(Utc.with_ymd_and_hms(2026, 9, 23, 1, 0, 0).unwrap());
     let fresh = SimBroker::new(Arc::new(clock), Calendar::default());
-    assert_eq!(restore(&app.store, &fresh).await.unwrap().len(), 2);
+    assert_eq!(restore(&app.store, &fresh).await.unwrap(), 2);
     assert_eq!(fresh.portfolio("bot").unwrap(), before);
     assert_eq!(fresh.order(resting.id).unwrap().status, atrader::broker::OrderStatus::Open);
 }
@@ -332,8 +258,7 @@ async fn fired_alerts_reach_the_agent_once(pool: PgPool) {
     let (bus, _) = broadcast::channel(64);
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let rec = Arc::new(Recorder { sent: Default::default(), fail: Default::default() });
-    let gens = std::collections::HashMap::from([("bot".to_string(), 1)]);
-    tokio::spawn(alert_loop(app.clone(), bus.subscribe(), cmd_rx, rec.clone(), gens));
+    tokio::spawn(alert_loop(app.clone(), bus.subscribe(), cmd_rx, rec.clone()));
     let alert = Alert {
         id: 0,
         account: "bot".into(),
@@ -373,7 +298,7 @@ async fn failed_deliveries_are_recorded(pool: PgPool) {
     let (bus, _) = broadcast::channel(64);
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let rec = Arc::new(Recorder { sent: Default::default(), fail: std::sync::atomic::AtomicBool::new(true) });
-    tokio::spawn(alert_loop(app.clone(), bus.subscribe(), cmd_rx, rec, std::collections::HashMap::from([("bot".to_string(), 1)])));
+    tokio::spawn(alert_loop(app.clone(), bus.subscribe(), cmd_rx, rec));
     let alert = Alert { id: 0, account: "bot".into(), generation: 1, condition: Condition::OrderFilled { id: None }, note: "fills".into(), once: false, created_at: Utc::now(), last_fired_at: None };
     let id = app.store.create_alert(&alert).await.unwrap();
     cmd_tx.send(AlertCmd::Upsert(Alert { id, ..alert })).unwrap();
@@ -449,7 +374,7 @@ async fn simultaneous_alerts_share_one_new_session(pool: PgPool) {
     let (bus, _) = broadcast::channel(64);
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let rec = Arc::new(Recorder { sent: Default::default(), fail: Default::default() });
-    tokio::spawn(alert_loop(app.clone(), bus.subscribe(), cmd_rx, rec.clone(), std::collections::HashMap::from([("bot".to_string(), 1)])));
+    tokio::spawn(alert_loop(app.clone(), bus.subscribe(), cmd_rx, rec.clone()));
     for price in [dec!(99000000), dec!(99500000)] {
         let a = Alert { id: 0, account: "bot".into(), generation: 1, condition: Condition::PriceAbove { id: "UPBIT:KRW-BTC".parse().unwrap(), price }, note: "n".into(), once: true, created_at: Utc::now(), last_fired_at: None };
         let id = app.store.create_alert(&a).await.unwrap();
@@ -466,4 +391,25 @@ async fn simultaneous_alerts_share_one_new_session(pool: PgPool) {
     let sent = rec.sent.lock().unwrap().clone();
     assert_eq!(sent.len(), 2);
     assert_eq!(sent.iter().filter(|s| s.2.is_none()).count(), 1, "both deliveries created a session: {sent:?}");
+}
+
+#[sqlx::test]
+async fn accounts_are_created_and_reset_live(pool: PgPool) {
+    let (app, t) = rig(pool).await;
+    app.create_account("fresh", "Fresh", Some("agent-2"), &[(Currency::Krw, dec!(1000000))]).await.unwrap();
+    assert!(t.list_accounts().await.unwrap().iter().any(|a| a.id == "fresh"));
+    t.place_order(buy("fresh", Some(dec!(0.001)), "first")).await.unwrap();
+    let generation = app.reset_account("fresh", &[(Currency::Krw, dec!(2000000))]).await.unwrap();
+    assert_eq!(generation, 2);
+    let acct = t.get_account("fresh".into()).await.unwrap();
+    assert_eq!(acct.equity_krw, dec!(2000000));
+    t.place_order(buy("fresh", Some(dec!(0.001)), "second")).await.unwrap();
+    for _ in 0..100 {
+        if !app.store.fills("fresh", 2, None, 10).await.unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(app.store.fills("fresh", 1, None, 10).await.unwrap().len(), 1);
+    assert_eq!(app.store.fills("fresh", 2, None, 10).await.unwrap().len(), 1);
 }

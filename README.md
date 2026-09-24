@@ -60,6 +60,20 @@ companies. KIS keys (`KIS_APP_KEY`, `KIS_APP_SECRET`) enable Korean and US stock
 `atrader account reset <id>` starts an account over and keeps its history. Stop `atrader serve`
 before a reset: a running server keeps trading the old state in memory.
 
+## Dashboard
+
+`atrader serve` also serves the dashboard on `127.0.0.1:8750` (set `ATRADER_HTTP_ADDR` to change
+it). Create the one login with `atrader user create <name>`; the first sign-in enrols an
+authenticator app (TOTP) and shows ten single-use recovery codes. To reach it from your other
+devices, publish it on your tailnet only:
+
+```bash
+tailscale serve --bg --https=443 http://127.0.0.1:8750
+```
+
+Lost the authenticator? `atrader user reset-2fa <name>` turns the second factor off and signs every
+session out; the next sign-in enrols again.
+
 ## Alerts
 
 The agent can set alerts (price levels, % moves, volume surges, its own fills, market open and
