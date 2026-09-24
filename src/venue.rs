@@ -129,6 +129,65 @@ impl FeeSchedule {
     }
 }
 
+use std::collections::{HashMap, HashSet};
+
+use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveTime, TimeZone, Utc, Weekday};
+use chrono_tz::Tz;
+
+/// Regular session in venue-local time. `None` = trades around the clock.
+fn session(venue: Venue) -> Option<(Tz, NaiveTime, NaiveTime)> {
+    let t = |h, m| NaiveTime::from_hms_opt(h, m, 0).unwrap();
+    match venue {
+        Venue::Krx => Some((chrono_tz::Asia::Seoul, t(9, 0), t(15, 30))),
+        Venue::Us => Some((chrono_tz::America::New_York, t(9, 30), t(16, 0))),
+        Venue::Upbit | Venue::Binance => None,
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Calendar {
+    holidays: HashMap<Venue, HashSet<NaiveDate>>,
+}
+
+impl Calendar {
+    pub fn new(holidays: HashMap<Venue, HashSet<NaiveDate>>) -> Self {
+        Calendar { holidays }
+    }
+
+    /// Parse `VENUE = ["YYYY-MM-DD", ...]` tables (see `holidays.toml`).
+    pub fn from_toml(src: &str) -> anyhow::Result<Self> {
+        let raw: HashMap<String, Vec<NaiveDate>> = toml::from_str(src)?;
+        let mut holidays = HashMap::new();
+        for (tag, days) in raw {
+            let venue = Venue::from_tag(&tag).ok_or_else(|| anyhow::anyhow!("unknown venue {tag:?}"))?;
+            holidays.insert(venue, days.into_iter().collect());
+        }
+        Ok(Calendar { holidays })
+    }
+
+    fn is_trading_day(&self, venue: Venue, d: NaiveDate) -> bool {
+        !matches!(d.weekday(), Weekday::Sat | Weekday::Sun)
+            && !self.holidays.get(&venue).is_some_and(|h| h.contains(&d))
+    }
+
+    pub fn is_open(&self, venue: Venue, now: DateTime<Utc>) -> bool {
+        let Some((tz, open, close)) = session(venue) else { return true };
+        let local = now.with_timezone(&tz);
+        self.is_trading_day(venue, local.date_naive()) && local.time() >= open && local.time() < close
+    }
+
+    pub fn next_open(&self, venue: Venue, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        let (tz, open, _) = session(venue)?;
+        let today = now.with_timezone(&tz).date_naive();
+        (0..15)
+            .map(|i| today + Duration::days(i))
+            .filter(|d| self.is_trading_day(venue, *d))
+            .filter_map(|d| tz.from_local_datetime(&d.and_time(open)).single())
+            .map(|t| t.with_timezone(&Utc))
+            .find(|t| *t > now)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,5 +245,59 @@ mod tests {
         assert_eq!(us.cost(Side::Sell, dec!(10000), 2), (dec!(0.28), dec!(0)));
         let upbit = FeeSchedule::default_for(Venue::Upbit);
         assert_eq!(upbit.cost(Side::Buy, dec!(1000000), 0), (dec!(500), dec!(0)));
+    }
+
+    use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+    use std::collections::{HashMap, HashSet};
+
+    fn utc(y: i32, m: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, m, d, h, mi, 0).unwrap()
+    }
+
+    #[test]
+    fn krx_session_in_seoul_time() {
+        let c = Calendar::default();
+        assert!(c.is_open(Venue::Krx, utc(2026, 9, 23, 1, 0))); // Wed 10:00 KST
+        assert!(!c.is_open(Venue::Krx, utc(2026, 9, 22, 23, 59))); // Wed 08:59 KST
+        assert!(!c.is_open(Venue::Krx, utc(2026, 9, 23, 6, 30))); // Wed 15:30 KST
+        assert!(!c.is_open(Venue::Krx, utc(2026, 9, 26, 1, 0))); // Sat
+    }
+
+    #[test]
+    fn next_open_skips_weekend_and_holidays() {
+        let holiday = NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let c = Calendar::new(HashMap::from([(Venue::Krx, HashSet::from([holiday]))]));
+        // Fri 16:00 KST -> Mon is a holiday -> Tue 09:00 KST.
+        assert_eq!(c.next_open(Venue::Krx, utc(2026, 9, 25, 7, 0)), Some(utc(2026, 9, 29, 0, 0)));
+        assert!(!c.is_open(Venue::Krx, utc(2026, 9, 28, 1, 0)));
+    }
+
+    #[test]
+    fn us_session_tracks_dst() {
+        let c = Calendar::default();
+        assert!(c.is_open(Venue::Us, utc(2026, 9, 23, 13, 30))); // 09:30 EDT
+        assert!(!c.is_open(Venue::Us, utc(2026, 9, 23, 13, 29)));
+        assert!(c.is_open(Venue::Us, utc(2026, 11, 2, 14, 30))); // 09:30 EST
+        assert!(!c.is_open(Venue::Us, utc(2026, 11, 2, 13, 30))); // 08:30 EST
+        assert!(!c.is_open(Venue::Us, utc(2026, 11, 2, 21, 0))); // 16:00 EST
+    }
+
+    #[test]
+    fn crypto_is_always_open() {
+        let c = Calendar::default();
+        assert!(c.is_open(Venue::Upbit, utc(2026, 9, 26, 3, 0)));
+        assert_eq!(c.next_open(Venue::Binance, utc(2026, 9, 26, 3, 0)), None);
+    }
+
+    #[test]
+    fn holidays_parse_from_toml() {
+        let c = Calendar::from_toml("KRX = [\"2026-09-25\"]\nUS = []").unwrap();
+        assert!(!c.is_open(Venue::Krx, utc(2026, 9, 25, 1, 0)));
+        assert!(Calendar::from_toml("NASDAQ = []").is_err());
+    }
+
+    #[test]
+    fn shipped_holiday_file_parses() {
+        Calendar::from_toml(include_str!("../holidays.toml")).unwrap();
     }
 }
