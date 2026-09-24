@@ -204,3 +204,24 @@ async fn persister_skips_integrity_failures_without_stalling(pool: PgPool) {
     assert!(started.elapsed() < std::time::Duration::from_secs(5), "retried a permanent failure");
     assert_eq!(store.max_order_id().await.unwrap(), 1);
 }
+
+#[sqlx::test]
+async fn bars_and_snapshots_round_trip(pool: PgPool) {
+    use atrader::candles::Candle;
+    use atrader::performance::{Snapshot, SnapshotKind};
+    use chrono::TimeZone;
+    let store = Store::new(pool);
+    let id: InstrumentId = "KRX:005930".parse().unwrap();
+    let at = |m| Utc.with_ymd_and_hms(2026, 9, 23, 1, m, 0).unwrap();
+    let c = |m, p| Candle { start: at(m), open: p, high: p, low: p, close: p, volume: dec!(1), value: p };
+    store.save_bars(&[(id.clone(), c(1, dec!(100))), (id.clone(), c(0, dec!(99)))]).await.unwrap();
+    store.save_bars(&[(id.clone(), c(1, dec!(101)))]).await.unwrap(); // upsert
+    let bars = store.bars(&id, at(0)).await.unwrap();
+    assert_eq!(bars.iter().map(|b| b.close).collect::<Vec<_>>(), vec![dec!(99), dec!(101)]);
+
+    store.create_account("a", "Test", None, &[(Currency::Krw, dec!(1))], Utc::now()).await.unwrap();
+    let s = Snapshot { account: "a".into(), generation: 1, at: at(5), kind: SnapshotKind::Daily, equity_krw: dec!(10), cash_krw: dec!(4), positions_krw: dec!(6) };
+    store.save_snapshot(&s).await.unwrap();
+    assert_eq!(store.snapshots("a", 1, None).await.unwrap(), vec![s.clone()]);
+    assert!(store.snapshots("a", 1, Some(at(6))).await.unwrap().is_empty());
+}

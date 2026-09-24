@@ -25,3 +25,4 @@ pub fn init_tls() {
 pub mod candles;
 pub mod screen;
 pub mod indicators;
+pub mod performance;

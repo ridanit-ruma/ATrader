@@ -11,7 +11,7 @@ use zyris::{ErrorCode, Payload};
 
 pub use dto::*;
 
-use crate::app::{App, krw_per};
+use crate::app::{App, value_account};
 use crate::broker::{OrderError, OrderRequest, OrderType, Tif};
 use crate::domain::{Currency, InstrumentId, Level, Venue};
 use crate::sim::Size;
@@ -181,7 +181,6 @@ impl TraderTools {
         let row = self.app.agent_account(account)?;
         let pf = self.app.broker.portfolio(&row.id).ok_or_else(|| order_error(OrderError::UnknownAccount))?;
         let usd_krw = self.app.fx.usd_krw().await.map_err(|e| upstream(format!("{e:#}")))?;
-        let mut rows = Vec::new();
         for (id, p) in &pf.positions {
             if p.qty.is_zero() {
                 continue;
@@ -189,49 +188,39 @@ impl TraderTools {
             if let Err(e) = self.app.market.ensure_fresh(id).await {
                 tracing::debug!(instrument = %id, error = %e, "valuing without fresh data");
             }
-            let price = self.app.broker.book_view(id, 1).and_then(|v| mid(&v.shadow_bids, &v.shadow_asks));
-            let cur = id.venue.currency();
-            let value = (p.qty * price.unwrap_or(p.avg_cost)).round_dp(cur.decimals());
-            let cost = p.qty * p.avg_cost;
-            let pct = if cost.is_zero() { Decimal::ZERO } else { ((value - cost) / cost * Decimal::ONE_HUNDRED).round_dp(2) };
-            let view = PositionView {
-                instrument: id.to_string(),
-                name: self.app.broker.instrument(id).map(|i| i.name).unwrap_or_default(),
-                currency: cur.code().into(),
-                qty: p.qty,
-                avg_cost: p.avg_cost.round_dp(8),
-                price,
-                market_value: value,
-                unrealized_pnl: (value - cost).round_dp(cur.decimals()),
-                unrealized_pct: pct,
-                weight_pct: Decimal::ZERO,
-            };
-            rows.push((view, value * krw_per(cur, usd_krw)));
         }
-        let mut cash = Vec::new();
-        let mut cash_krw = Decimal::ZERO;
-        for c in [Currency::Krw, Currency::Usd, Currency::Usdt] {
-            if let Some(balance) = pf.cash.get(&c).copied() {
-                cash.push(CashView { currency: c.code().into(), balance, available: pf.available_cash(c) });
-                cash_krw += balance * krw_per(c, usd_krw);
-            }
-        }
-        let positions_krw: Decimal = rows.iter().map(|(_, v)| *v).sum();
-        let equity = cash_krw + positions_krw;
-        rows.sort_by(|a, b| b.1.cmp(&a.1));
-        let positions = rows
+        let v = value_account(&self.app.broker, &pf, usd_krw);
+        let mut lines = v.lines;
+        lines.sort_by(|a, b| b.value_krw.cmp(&a.value_krw));
+        let positions = lines
             .into_iter()
-            .map(|(mut p, v)| {
-                p.weight_pct = if equity.is_zero() { Decimal::ZERO } else { (v / equity * Decimal::ONE_HUNDRED).round_dp(2) };
-                p
+            .map(|l| {
+                let cur = l.id.venue.currency();
+                let cost = l.qty * l.avg_cost;
+                PositionView {
+                    instrument: l.id.to_string(),
+                    name: self.app.broker.instrument(&l.id).map(|i| i.name).unwrap_or_default(),
+                    currency: cur.code().into(),
+                    qty: l.qty,
+                    avg_cost: l.avg_cost.round_dp(8),
+                    price: l.price,
+                    market_value: l.value,
+                    unrealized_pnl: (l.value - cost).round_dp(cur.decimals()),
+                    unrealized_pct: if cost.is_zero() { Decimal::ZERO } else { ((l.value - cost) / cost * Decimal::ONE_HUNDRED).round_dp(2) },
+                    weight_pct: if v.equity_krw.is_zero() { Decimal::ZERO } else { (l.value_krw / v.equity_krw * Decimal::ONE_HUNDRED).round_dp(2) },
+                }
             })
+            .collect();
+        let cash = [Currency::Krw, Currency::Usd, Currency::Usdt]
+            .into_iter()
+            .filter_map(|c| pf.cash.get(&c).map(|b| CashView { currency: c.code().into(), balance: *b, available: pf.available_cash(c) }))
             .collect();
         let summary = AccountSummary {
             id: row.id,
             name: row.name,
             cash,
-            positions_value_krw: positions_krw.round_dp(0),
-            equity_krw: equity.round_dp(0),
+            positions_value_krw: v.positions_krw.round_dp(0),
+            equity_krw: v.equity_krw.round_dp(0),
             usd_krw,
             as_of: self.app.broker.now(),
         };

@@ -203,9 +203,11 @@ async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
     tracing::info!(instruments, accounts = generations.len(), "state restored");
 
     tokio::spawn(pump(events_rx, broker.clone(), bus.clone()));
-    let writer = tokio::spawn(persist(journal_rx, store.clone(), bus.clone(), generations));
+    let writer = tokio::spawn(persist(journal_rx, store.clone(), bus.clone(), generations.clone()));
+    tokio::spawn(crate::app::bar_loop(bus.subscribe(), store.clone()));
     let app = Arc::new(App::new(broker.clone(), store, market, FxCache::new()).await?);
     app.market.refresh_pins();
+    tokio::spawn(crate::app::snapshot_loop(app.clone(), generations));
 
     let timers = app.clone();
     tokio::spawn(async move {

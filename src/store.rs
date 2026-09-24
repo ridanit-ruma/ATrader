@@ -11,6 +11,8 @@ use crate::broker::{Conversion, Fill, Liquidity, Order, OrderRequest, OrderStatu
 use crate::domain::{Currency, InstrumentId, Side};
 use crate::ledger::Portfolio;
 use crate::sim::Size;
+use crate::candles::Candle;
+use crate::performance::{Snapshot, SnapshotKind};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccountRow {
@@ -314,6 +316,91 @@ impl Store {
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(parse_fill).collect()
+    }
+
+    pub async fn save_bars(&self, bars: &[(InstrumentId, Candle)]) -> sqlx::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for (id, c) in bars {
+            sqlx::query(
+                "INSERT INTO bars (instrument, start, open, high, low, close, volume, value) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                 ON CONFLICT (instrument, start) DO UPDATE SET open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low,
+                     close = EXCLUDED.close, volume = EXCLUDED.volume, value = EXCLUDED.value",
+            )
+            .bind(id.to_string())
+            .bind(c.start)
+            .bind(c.open)
+            .bind(c.high)
+            .bind(c.low)
+            .bind(c.close)
+            .bind(c.volume)
+            .bind(c.value)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await
+    }
+
+    /// 1-minute bars from `since`, oldest first.
+    pub async fn bars(&self, id: &InstrumentId, since: DateTime<Utc>) -> sqlx::Result<Vec<Candle>> {
+        let rows = sqlx::query("SELECT * FROM bars WHERE instrument = $1 AND start >= $2 ORDER BY start")
+            .bind(id.to_string())
+            .bind(since)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| Candle {
+                start: r.get("start"),
+                open: r.get("open"),
+                high: r.get("high"),
+                low: r.get("low"),
+                close: r.get("close"),
+                volume: r.get("volume"),
+                value: r.get("value"),
+            })
+            .collect())
+    }
+
+    pub async fn save_snapshot(&self, s: &Snapshot) -> sqlx::Result<()> {
+        sqlx::query(
+            "INSERT INTO equity_snapshots (account_id, generation, at, kind, equity_krw, cash_krw, positions_krw)
+             VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING",
+        )
+        .bind(&s.account)
+        .bind(s.generation)
+        .bind(s.at)
+        .bind(if s.kind == SnapshotKind::Daily { "daily" } else { "minute" })
+        .bind(s.equity_krw)
+        .bind(s.cash_krw)
+        .bind(s.positions_krw)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Oldest first; `since` inclusive.
+    pub async fn snapshots(&self, account: &str, generation: i32, since: Option<DateTime<Utc>>) -> sqlx::Result<Vec<Snapshot>> {
+        let rows = sqlx::query(
+            "SELECT * FROM equity_snapshots WHERE account_id = $1 AND generation = $2 AND ($3::timestamptz IS NULL OR at >= $3)
+             ORDER BY at, kind",
+        )
+        .bind(account)
+        .bind(generation)
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| Snapshot {
+                account: r.get("account_id"),
+                generation: r.get("generation"),
+                at: r.get("at"),
+                kind: if r.get::<String, _>("kind") == "daily" { SnapshotKind::Daily } else { SnapshotKind::Minute },
+                equity_krw: r.get("equity_krw"),
+                cash_krw: r.get("cash_krw"),
+                positions_krw: r.get("positions_krw"),
+            })
+            .collect())
     }
 
     pub async fn cash_balances(&self, account: &str, generation: i32) -> sqlx::Result<HashMap<Currency, Decimal>> {
