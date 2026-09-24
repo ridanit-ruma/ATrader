@@ -16,6 +16,8 @@ use crate::domain::{Book, Clock, InstrumentId, Level, Trade, Venue};
 use crate::sim::DailyStats;
 use crate::stats::daily_stats;
 use crate::venue::{Instrument, LotRule, TickRule};
+use crate::candles::{Candle, Interval};
+use crate::screen::{Ranking, ScreenRow, rank};
 
 const REST: &str = "https://api.binance.com/api/v3";
 const WS: &str = "wss://stream.binance.com:9443/stream?streams=";
@@ -174,6 +176,14 @@ impl MarketFeed for BinanceFeed {
         parse_klines(&self.get(&format!("/klines?symbol={}&interval=1d&limit=21", id.symbol)).await?)
     }
 
+    async fn candles(&self, id: &InstrumentId, interval: Interval, limit: usize) -> anyhow::Result<Vec<Candle>> {
+        parse_klines_ohlc(&self.get(&format!("/klines?symbol={}&interval={}&limit={}", id.symbol, interval.code(), limit.min(200))).await?)
+    }
+
+    async fn screen(&self, ranking: Ranking, limit: usize) -> anyhow::Result<Vec<ScreenRow>> {
+        Ok(rank(parse_tickers(&self.get("/ticker/24hr").await?)?, ranking, limit))
+    }
+
     async fn stream(&self, ids: &[InstrumentId], tx: &mpsc::Sender<MarketEvent>) -> anyhow::Result<()> {
         let (mut ws, _) = tokio_tungstenite::connect_async(stream_url(ids)).await?;
         loop {
@@ -191,6 +201,55 @@ impl MarketFeed for BinanceFeed {
             }
         }
     }
+}
+
+/// Klines (oldest first): open time, open, high, low, close, volume, close time, quote volume.
+pub fn parse_klines_ohlc(bytes: &[u8]) -> anyhow::Result<Vec<Candle>> {
+    let rows: Vec<Vec<Value>> = serde_json::from_slice(bytes)?;
+    rows.iter()
+        .map(|r| {
+            let d = |i: usize| -> anyhow::Result<Decimal> {
+                r.get(i).and_then(Value::as_str).ok_or_else(|| anyhow!("kline field {i} missing"))?.parse().map_err(Into::into)
+            };
+            let ms = r.first().and_then(Value::as_i64).ok_or_else(|| anyhow!("kline without open time"))?;
+            Ok(Candle {
+                start: DateTime::from_timestamp_millis(ms).ok_or_else(|| anyhow!("bad open time {ms}"))?,
+                open: d(1)?,
+                high: d(2)?,
+                low: d(3)?,
+                close: d(4)?,
+                volume: d(5)?,
+                value: d(7)?,
+            })
+        })
+        .collect()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawTicker {
+    symbol: String,
+    price_change_percent: Decimal,
+    last_price: Decimal,
+    volume: Decimal,
+    quote_volume: Decimal,
+}
+
+/// 24 h tickers, USDT pairs only.
+pub fn parse_tickers(bytes: &[u8]) -> anyhow::Result<Vec<ScreenRow>> {
+    let raw: Vec<RawTicker> = serde_json::from_slice(bytes)?;
+    Ok(raw
+        .into_iter()
+        .filter(|t| t.symbol.ends_with("USDT"))
+        .map(|t| ScreenRow {
+            id: id(&t.symbol),
+            name: None,
+            price: t.last_price,
+            change_pct: t.price_change_percent.round_dp(2),
+            volume: t.volume,
+            value: t.quote_volume,
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -252,5 +311,17 @@ mod tests {
             stream_url(&ids),
             "wss://stream.binance.com:9443/stream?streams=btcusdt@depth20@100ms/btcusdt@trade/ethusdt@depth20@100ms/ethusdt@trade"
         );
+    }
+
+    #[test]
+    fn klines_and_tickers() {
+        let body = r#"[[1790208000000,"84397.6","84622.01","82874.93","83508.08","8469.88",1790294399999,"710303659.28",1,"1","1","0"]]"#;
+        let c = parse_klines_ohlc(body.as_bytes()).unwrap();
+        assert_eq!((c[0].start.timestamp_millis(), c[0].close, c[0].value), (1790208000000, dec!(83508.08), dec!(710303659.28)));
+        let t = r#"[{"symbol":"BTCUSDT","priceChangePercent":"-2.430","lastPrice":"83416.53","volume":"22733.4","quoteVolume":"1915525633.01"},
+                   {"symbol":"ETHBTC","priceChangePercent":"1","lastPrice":"0.03","volume":"1","quoteVolume":"1"}]"#;
+        let rows = parse_tickers(t.as_bytes()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].id.to_string(), rows[0].change_pct), ("BINANCE:BTCUSDT".to_string(), dec!(-2.43)));
     }
 }

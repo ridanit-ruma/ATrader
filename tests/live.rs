@@ -86,3 +86,18 @@ async fn kis_us_live() {
     assert!(!book.bids.is_empty() || !book.asks.is_empty(), "{book:?}");
     assert!(feed.daily_stats(&id).await.unwrap().sigma > 0.0);
 }
+
+#[tokio::test]
+#[ignore]
+async fn crypto_candles_and_screens_live() {
+    use atrader::candles::Interval;
+    use atrader::screen::Ranking;
+    let upbit = UpbitFeed::new(Arc::new(SystemClock));
+    let c = upbit.candles(&"UPBIT:KRW-BTC".parse().unwrap(), Interval::M5, 10).await.unwrap();
+    assert_eq!(c.len(), 10);
+    assert!(c[0].start < c[9].start);
+    assert_eq!(upbit.screen(Ranking::Value, 5).await.unwrap().len(), 5);
+    let binance = BinanceFeed::new(Arc::new(SystemClock));
+    assert_eq!(binance.candles(&"BINANCE:BTCUSDT".parse().unwrap(), Interval::D1, 3).await.unwrap().len(), 3);
+    assert_eq!(binance.screen(Ranking::Gainers, 5).await.unwrap().len(), 5);
+}

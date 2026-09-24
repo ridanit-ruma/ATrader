@@ -14,6 +14,8 @@ use tokio::sync::{mpsc, watch};
 use crate::domain::{Book, InstrumentId, Trade, Venue};
 use crate::sim::DailyStats;
 use crate::venue::Instrument;
+use crate::candles::{Candle, Interval};
+use crate::screen::{Ranking, ScreenRow};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MarketEvent {
@@ -27,6 +29,16 @@ pub trait MarketFeed: Send + Sync {
     async fn instruments(&self) -> anyhow::Result<Vec<Instrument>>;
     async fn snapshot(&self, id: &InstrumentId) -> anyhow::Result<Book>;
     async fn daily_stats(&self, id: &InstrumentId) -> anyhow::Result<DailyStats>;
+    /// OHLCV candles, oldest first; the last may still be forming.
+    async fn candles(&self, _id: &InstrumentId, interval: Interval, _limit: usize) -> anyhow::Result<Vec<Candle>> {
+        anyhow::bail!("unsupported: {} has no {} candles", self.venue().tag(), interval.code())
+    }
+
+    /// Venue-wide ranking.
+    async fn screen(&self, _ranking: Ranking, _limit: usize) -> anyhow::Result<Vec<ScreenRow>> {
+        anyhow::bail!("unsupported: {} has no ranking data", self.venue().tag())
+    }
+
     /// Stream books and trades for `ids` into `tx`. Returns `Ok` only when `tx` is closed; any
     /// disconnect or idle timeout is an error so the runner reconnects.
     async fn stream(&self, ids: &[InstrumentId], tx: &mpsc::Sender<MarketEvent>) -> anyhow::Result<()>;

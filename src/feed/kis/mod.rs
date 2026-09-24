@@ -18,6 +18,8 @@ use crate::domain::{Book, Clock, InstrumentId, Venue};
 use crate::feed::{MarketEvent, MarketFeed, next_or_idle};
 use crate::sim::DailyStats;
 use crate::venue::{Calendar, Instrument};
+use crate::candles::{Candle, Interval};
+use crate::screen::{Ranking, ScreenRow};
 use std::path::{Path, PathBuf};
 use std::time::{Duration as StdDuration, Instant};
 
@@ -414,6 +416,83 @@ impl MarketFeed for KisKrxFeed {
         rest::krx_daily_stats(&body)
     }
 
+    async fn candles(&self, id: &InstrumentId, interval: Interval, limit: usize) -> anyhow::Result<Vec<Candle>> {
+        let period = match interval {
+            Interval::D1 => "D",
+            Interval::W1 => "W",
+            other => anyhow::bail!("unsupported: KRX {} candles come from stored bars", other.code()),
+        };
+        let end = self.today();
+        let days = if interval == Interval::W1 { 7 * limit as i64 } else { (limit as i64 * 7) / 5 + 10 };
+        let start = end - chrono::Duration::days(days);
+        let (s, e) = (start.format("%Y%m%d").to_string(), end.format("%Y%m%d").to_string());
+        let body = self
+            .client
+            .get(
+                "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
+                "FHKST03010100",
+                &[("FID_COND_MRKT_DIV_CODE", "J"), ("FID_INPUT_ISCD", &id.symbol), ("FID_INPUT_DATE_1", &s), ("FID_INPUT_DATE_2", &e), ("FID_PERIOD_DIV_CODE", period), ("FID_ORG_ADJ_PRC", "0")],
+            )
+            .await?;
+        let mut c = rest::krx_candles(&body)?;
+        let skip = c.len().saturating_sub(limit);
+        Ok(c.split_off(skip))
+    }
+
+    // ponytail: KRX losers sort code "0001" and the US ranking parameters are unverified without KIS keys.
+    async fn screen(&self, ranking: Ranking, limit: usize) -> anyhow::Result<Vec<ScreenRow>> {
+        let body = match ranking {
+            Ranking::Gainers | Ranking::Losers => {
+                let sort = if ranking == Ranking::Gainers { "0000" } else { "0001" };
+                self.client
+                    .get(
+                        "/uapi/domestic-stock/v1/ranking/fluctuation",
+                        "FHPST01700000",
+                        &[
+                            ("fid_cond_mrkt_div_code", "J"),
+                            ("fid_cond_scr_div_code", "20170"),
+                            ("fid_input_iscd", "0000"),
+                            ("fid_rank_sort_cls_code", sort),
+                            ("fid_input_cnt_1", "0"),
+                            ("fid_prc_cls_code", "0"),
+                            ("fid_input_price_1", ""),
+                            ("fid_input_price_2", ""),
+                            ("fid_vol_cnt", ""),
+                            ("fid_trgt_cls_code", "0"),
+                            ("fid_trgt_exls_cls_code", "0"),
+                            ("fid_div_cls_code", "0"),
+                            ("fid_rsfl_rate1", ""),
+                            ("fid_rsfl_rate2", ""),
+                        ],
+                    )
+                    .await?
+            }
+            Ranking::Volume | Ranking::Value => {
+                let by = if ranking == Ranking::Volume { "0" } else { "3" };
+                self.client
+                    .get(
+                        "/uapi/domestic-stock/v1/quotations/volume-rank",
+                        "FHPST01710000",
+                        &[
+                            ("FID_COND_MRKT_DIV_CODE", "J"),
+                            ("FID_COND_SCR_DIV_CODE", "20171"),
+                            ("FID_INPUT_ISCD", "0000"),
+                            ("FID_DIV_CLS_CODE", "0"),
+                            ("FID_BLNG_CLS_CODE", by),
+                            ("FID_TRGT_CLS_CODE", "111111111"),
+                            ("FID_TRGT_EXLS_CLS_CODE", "0000000000"),
+                            ("FID_INPUT_PRICE_1", ""),
+                            ("FID_INPUT_PRICE_2", ""),
+                            ("FID_VOL_CNT", ""),
+                            ("FID_INPUT_DATE_1", ""),
+                        ],
+                    )
+                    .await?
+            }
+        };
+        Ok(crate::screen::rank(rest::krx_rank_rows(&body), ranking, limit))
+    }
+
     async fn stream(&self, ids: &[InstrumentId], tx: &mpsc::Sender<MarketEvent>) -> anyhow::Result<()> {
         wait_for_session(&self.calendar, self.clock.as_ref(), Venue::Krx).await;
         for id in ids {
@@ -488,6 +567,38 @@ impl MarketFeed for KisUsFeed {
             )
             .await?;
         rest::us_daily_stats(&body)
+    }
+
+    async fn candles(&self, id: &InstrumentId, interval: Interval, limit: usize) -> anyhow::Result<Vec<Candle>> {
+        let gubn = match interval {
+            Interval::D1 => "0",
+            Interval::W1 => "1",
+            other => anyhow::bail!("unsupported: US {} candles come from stored bars", other.code()),
+        };
+        let excd = self.excd(id)?;
+        let body = self
+            .client
+            .get("/uapi/overseas-price/v1/quotations/dailyprice", "HHDFS76240000", &[("AUTH", ""), ("EXCD", &excd), ("SYMB", &id.symbol), ("GUBN", gubn), ("BYMD", ""), ("MODP", "1")])
+            .await?;
+        let mut c = rest::us_candles(&body)?;
+        let skip = c.len().saturating_sub(limit);
+        Ok(c.split_off(skip))
+    }
+
+    async fn screen(&self, ranking: Ranking, limit: usize) -> anyhow::Result<Vec<ScreenRow>> {
+        let (path, tr_id, extra): (&str, &str, &[(&str, &str)]) = match ranking {
+            Ranking::Gainers => ("/uapi/overseas-stock/v1/ranking/updown-rate", "HHDFS76290000", &[("GUBN", "1")]),
+            Ranking::Losers => ("/uapi/overseas-stock/v1/ranking/updown-rate", "HHDFS76290000", &[("GUBN", "0")]),
+            Ranking::Volume => ("/uapi/overseas-stock/v1/ranking/trade-vol", "HHDFS76310010", &[("PRC1", ""), ("PRC2", "")]),
+            Ranking::Value => ("/uapi/overseas-stock/v1/ranking/trade-pbmn", "HHDFS76320010", &[("PRC1", ""), ("PRC2", "")]),
+        };
+        let mut rows = Vec::new();
+        for excd in ["NAS", "NYS"] {
+            let mut q: Vec<(&str, &str)> = vec![("EXCD", excd), ("NDAY", "0"), ("VOL_RANG", "0"), ("AUTH", ""), ("KEYB", "")];
+            q.extend_from_slice(extra);
+            rows.extend(rest::us_rank_rows(&self.client.get(path, tr_id, &q).await?));
+        }
+        Ok(crate::screen::rank(rows, ranking, limit))
     }
 
     async fn stream(&self, ids: &[InstrumentId], tx: &mpsc::Sender<MarketEvent>) -> anyhow::Result<()> {

@@ -18,6 +18,8 @@ use crate::domain::{Book, Clock, InstrumentId, Level, Trade, Venue};
 use crate::sim::DailyStats;
 use crate::stats::daily_stats;
 use crate::venue::{Instrument, LotRule, TickRule};
+use crate::candles::{Candle, Interval};
+use crate::screen::{Ranking, ScreenRow, rank};
 
 const REST: &str = "https://api.upbit.com/v1";
 const WS: &str = "wss://api.upbit.com/websocket/v1";
@@ -161,6 +163,22 @@ impl MarketFeed for UpbitFeed {
         parse_candles(&self.get(&format!("/candles/days?market={}&count=21", id.symbol)).await?)
     }
 
+    async fn candles(&self, id: &InstrumentId, interval: Interval, limit: usize) -> anyhow::Result<Vec<Candle>> {
+        let path = match interval {
+            Interval::M1 => "/candles/minutes/1",
+            Interval::M5 => "/candles/minutes/5",
+            Interval::M15 => "/candles/minutes/15",
+            Interval::H1 => "/candles/minutes/60",
+            Interval::D1 => "/candles/days",
+            Interval::W1 => "/candles/weeks",
+        };
+        parse_candles_ohlc(&self.get(&format!("{path}?market={}&count={}", id.symbol, limit.min(200))).await?)
+    }
+
+    async fn screen(&self, ranking: Ranking, limit: usize) -> anyhow::Result<Vec<ScreenRow>> {
+        Ok(rank(parse_tickers(&self.get("/ticker/all?quote_currencies=KRW").await?)?, ranking, limit))
+    }
+
     async fn stream(&self, ids: &[InstrumentId], tx: &mpsc::Sender<MarketEvent>) -> anyhow::Result<()> {
         let (mut ws, _) = tokio_tungstenite::connect_async(WS).await?;
         ws.send(Message::text(subscribe_message(ids))).await?;
@@ -179,6 +197,55 @@ impl MarketFeed for UpbitFeed {
             }
         }
     }
+}
+
+#[derive(Deserialize)]
+struct RawOhlc {
+    candle_date_time_utc: String,
+    opening_price: Decimal,
+    high_price: Decimal,
+    low_price: Decimal,
+    trade_price: Decimal,
+    candle_acc_trade_volume: Decimal,
+    candle_acc_trade_price: Decimal,
+}
+
+/// Upbit candles arrive newest first.
+pub fn parse_candles_ohlc(bytes: &[u8]) -> anyhow::Result<Vec<Candle>> {
+    let raw: Vec<RawOhlc> = serde_json::from_slice(bytes)?;
+    let mut out = raw
+        .into_iter()
+        .map(|r| {
+            let start = chrono::NaiveDateTime::parse_from_str(&r.candle_date_time_utc, "%Y-%m-%dT%H:%M:%S")?.and_utc();
+            Ok(Candle { start, open: r.opening_price, high: r.high_price, low: r.low_price, close: r.trade_price, volume: r.candle_acc_trade_volume, value: r.candle_acc_trade_price })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    out.reverse();
+    Ok(out)
+}
+
+#[derive(Deserialize)]
+struct RawTicker {
+    market: String,
+    trade_price: Decimal,
+    signed_change_rate: Decimal,
+    acc_trade_price_24h: Decimal,
+    acc_trade_volume_24h: Decimal,
+}
+
+pub fn parse_tickers(bytes: &[u8]) -> anyhow::Result<Vec<ScreenRow>> {
+    let raw: Vec<RawTicker> = serde_json::from_slice(bytes)?;
+    Ok(raw
+        .into_iter()
+        .map(|t| ScreenRow {
+            id: id(&t.market),
+            name: None,
+            price: t.trade_price,
+            change_pct: (t.signed_change_rate * Decimal::ONE_HUNDRED).round_dp(2),
+            volume: t.acc_trade_volume_24h,
+            value: t.acc_trade_price_24h,
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -257,5 +324,20 @@ mod tests {
         assert_eq!(v[1]["type"], "orderbook");
         assert_eq!(v[1]["codes"], serde_json::json!(["KRW-BTC", "KRW-ETH"]));
         assert_eq!(v[2]["type"], "trade");
+    }
+
+    #[test]
+    fn candles_and_tickers() {
+        let body = r#"[{"market":"KRW-BTC","candle_date_time_utc":"2026-09-24T11:45:00","opening_price":2,"high_price":3,"low_price":1,"trade_price":2.5,"candle_acc_trade_price":100,"candle_acc_trade_volume":40},
+                      {"market":"KRW-BTC","candle_date_time_utc":"2026-09-24T11:40:00","opening_price":1,"high_price":2,"low_price":1,"trade_price":2,"candle_acc_trade_price":50,"candle_acc_trade_volume":30}]"#;
+        let c = parse_candles_ohlc(body.as_bytes()).unwrap();
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[0].start, Utc.with_ymd_and_hms(2026, 9, 24, 11, 40, 0).unwrap()); // oldest first
+        assert_eq!((c[1].close, c[1].value, c[1].volume), (dec!(2.5), dec!(100), dec!(40)));
+        let tickers = r#"[{"market":"KRW-XRP","trade_price":2020.0,"signed_change_rate":-0.0198932557,"acc_trade_price_24h":375315639087.83765,"acc_trade_volume_24h":181545431.40572014}]"#;
+        let rows = parse_tickers(tickers.as_bytes()).unwrap();
+        assert_eq!(rows[0].id.to_string(), "UPBIT:KRW-XRP");
+        assert_eq!(rows[0].change_pct, dec!(-1.99));
+        assert_eq!(rows[0].value, dec!(375315639087.83765));
     }
 }
