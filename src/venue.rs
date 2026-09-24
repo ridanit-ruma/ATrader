@@ -9,6 +9,9 @@ pub enum TickRule {
     Krx,
     /// US equities: $0.01 at or above $1, $0.0001 below.
     Us,
+    /// Upbit KRW market table (docs.upbit.com "KRW market info", checked 2026-09-24).
+    // ponytail: Upbit's per-coin tick exceptions are not modelled; add them when a listed coin trips INVALID_TICK.
+    Upbit,
     /// One tick size for every price (crypto, from exchange metadata).
     Fixed(Decimal),
 }
@@ -16,6 +19,24 @@ pub enum TickRule {
 /// (upper bound exclusive, tick) pairs; 1,000 above the last bound.
 const KRX_TICKS: [(i64, i64); 6] =
     [(2_000, 1), (5_000, 5), (20_000, 10), (50_000, 50), (200_000, 100), (500_000, 500)];
+
+/// (lower bound inclusive, tick), highest first; below the last bound the tick is 0.00000001.
+const UPBIT_TICKS: [(Decimal, Decimal); 14] = [
+    (dec!(1000000), dec!(1000)),
+    (dec!(500000), dec!(500)),
+    (dec!(100000), dec!(100)),
+    (dec!(50000), dec!(50)),
+    (dec!(10000), dec!(10)),
+    (dec!(5000), dec!(5)),
+    (dec!(100), dec!(1)),
+    (dec!(10), dec!(0.1)),
+    (dec!(1), dec!(0.01)),
+    (dec!(0.1), dec!(0.001)),
+    (dec!(0.01), dec!(0.0001)),
+    (dec!(0.001), dec!(0.00001)),
+    (dec!(0.0001), dec!(0.000001)),
+    (dec!(0.00001), dec!(0.0000001)),
+];
 
 impl TickRule {
     pub fn size_at(&self, price: Decimal) -> Decimal {
@@ -31,6 +52,10 @@ impl TickRule {
                     dec!(0.0001)
                 }
             }
+            TickRule::Upbit => UPBIT_TICKS
+                .iter()
+                .find(|(lower, _)| price >= *lower)
+                .map_or(dec!(0.00000001), |(_, t)| *t),
             TickRule::Fixed(t) => *t,
         }
     }
@@ -303,5 +328,25 @@ mod tests {
     #[test]
     fn shipped_holiday_file_parses() {
         Calendar::from_toml(include_str!("../holidays.toml")).unwrap();
+    }
+
+    #[test]
+    fn upbit_krw_ticks() {
+        let t = TickRule::Upbit;
+        assert_eq!(t.size_at(dec!(114851000)), dec!(1000));
+        assert_eq!(t.size_at(dec!(1000000)), dec!(1000));
+        assert_eq!(t.size_at(dec!(750000)), dec!(500));
+        assert_eq!(t.size_at(dec!(120000)), dec!(100));
+        assert_eq!(t.size_at(dec!(60000)), dec!(50));
+        assert_eq!(t.size_at(dec!(12000)), dec!(10));
+        assert_eq!(t.size_at(dec!(7000)), dec!(5));
+        assert_eq!(t.size_at(dec!(3000)), dec!(1));
+        assert_eq!(t.size_at(dec!(500)), dec!(1));
+        assert_eq!(t.size_at(dec!(50)), dec!(0.1));
+        assert_eq!(t.size_at(dec!(5)), dec!(0.01));
+        assert_eq!(t.size_at(dec!(0.5)), dec!(0.001));
+        assert_eq!(t.size_at(dec!(0.000001)), dec!(0.00000001));
+        assert!(t.is_valid(dec!(114851000)));
+        assert!(!t.is_valid(dec!(114851500)));
     }
 }
