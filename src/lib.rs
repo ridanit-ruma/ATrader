@@ -4,6 +4,7 @@ pub mod fx;
 pub mod venue;
 pub mod sim;
 pub mod ledger;
+pub mod market;
 pub mod broker;
 pub mod store;
 pub mod subs;
