@@ -12,6 +12,7 @@ Spec: `docs/superpowers/specs/2026-09-24-atrader-design.md`. Plans: `docs/superp
 - Live network smoke tests: `cargo test --test live -- --ignored`
 - Dashboard: `cd web && npm ci && npm run build` (the binary embeds `web/dist`); `npm run dev` proxies `/api` to `127.0.0.1:8750`; `npm test` runs vitest
 - Nix: `nix build` (package), `nix build .#checks.x86_64-linux.vm` (NixOS VM test of the module). After changing `web/package-lock.json`, update `npmDepsHash` in `nix/package.nix` (`nix run nixpkgs#prefetch-npm-deps -- web/package-lock.json`)
+- Local-only feeds: `src/feed/private/` is git-ignored (it has its own local git repo) and is compiled with `--features private-feeds`; `feed::private::without_kis` supplies feeds when KIS has no keys. Deploys set `ATRADER_FEATURES=private-feeds` and copy the folder over. Never commit it to the public repo.
 - Stop Postgres: `nix shell nixpkgs#postgresql_16 -c pg_ctl -D .dev/pg stop`
 
 ## Conventions

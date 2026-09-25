@@ -210,7 +210,11 @@ async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
             feeds.push((Arc::new(crate::feed::kis::KisKrxFeed::new(client.clone(), clock.clone(), calendar.clone())), 10));
             feeds.push((Arc::new(crate::feed::kis::KisUsFeed::new(client, clock.clone(), calendar)), 10));
         }
-        None => tracing::info!("KIS_APP_KEY/KIS_APP_SECRET not set; KRX and US stocks are disabled"),
+        None => {
+            #[cfg(feature = "private-feeds")]
+            feeds.extend(crate::feed::private::without_kis(clock.clone(), Calendar::from_toml(include_str!("../holidays.toml"))?));
+            tracing::info!("KIS_APP_KEY/KIS_APP_SECRET not set; KIS feeds are off");
+        }
     }
 
     for (feed, cap) in feeds {

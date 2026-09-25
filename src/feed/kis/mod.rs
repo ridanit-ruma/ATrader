@@ -292,7 +292,7 @@ async fn stream_ws(
 }
 
 /// Outside the venue's session there is nothing to stream: wait for the next open.
-async fn wait_for_session(calendar: &Calendar, clock: &dyn Clock, venue: Venue) {
+pub(crate) async fn wait_for_session(calendar: &Calendar, clock: &dyn Clock, venue: Venue) {
     let now = clock.now();
     if calendar.is_open(venue, now) {
         return;
@@ -304,7 +304,7 @@ async fn wait_for_session(calendar: &Calendar, clock: &dyn Clock, venue: Venue) 
     }
 }
 
-async fn download_master(client: &reqwest::Client, file: &str) -> anyhow::Result<Vec<u8>> {
+pub(crate) async fn download_master(client: &reqwest::Client, file: &str) -> anyhow::Result<Vec<u8>> {
     let zip = client.get(format!("{}/{file}.zip", master::MASTER_BASE)).send().await?.error_for_status()?.bytes().await?;
     master::unzip_first(&zip)
 }

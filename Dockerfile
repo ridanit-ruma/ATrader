@@ -14,7 +14,8 @@ COPY Cargo.toml Cargo.lock holidays.toml fees.toml ./
 COPY migrations ./migrations
 COPY src ./src
 COPY --from=web /web/dist ./web/dist
-RUN cargo build --release --locked
+ARG FEATURES=""
+RUN cargo build --release --locked --features "${FEATURES}"
 
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \

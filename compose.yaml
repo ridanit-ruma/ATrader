@@ -24,6 +24,7 @@ services:
       network: host
       args:
         UID: ${UID:-1000}
+        FEATURES: ${ATRADER_FEATURES:-}
     image: atrader:local
     # Host networking: the dashboard binds host loopback, so `tailscale serve` is the only way in,
     # and requests proxied from loopback keep their real client address.

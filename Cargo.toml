@@ -39,3 +39,7 @@ zyris-attacca = { git = "https://github.com/attacca-cc/zyris-protocol", rev = "4
 tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["test-util", "rt-multi-thread", "macros", "sync", "time"] }
 tower = { version = "0.5", features = ["util"] }
+
+[features]
+# Feeds kept out of this repository (src/feed/private/, git-ignored).
+private-feeds = []

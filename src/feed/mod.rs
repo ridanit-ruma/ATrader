@@ -4,6 +4,10 @@
 pub mod binance;
 pub mod kis;
 pub mod upbit;
+/// Feeds kept out of the public repository (`src/feed/private/`, git-ignored), compiled in with
+/// `--features private-feeds`. They stand in for KIS when it has no keys.
+#[cfg(feature = "private-feeds")]
+pub mod private;
 
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH};
