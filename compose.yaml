@@ -1,0 +1,55 @@
+# ATrader with its own Postgres. Setup: see "Running with Docker" in the README.
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: atrader
+      POSTGRES_DB: atrader
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets: [db_password]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    # Loopback only, for atrader on the host network.
+    ports: ["127.0.0.1:${ATRADER_DB_PORT:-54330}:5432"]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "atrader"]
+      interval: 5s
+      retries: 20
+    restart: unless-stopped
+
+  atrader:
+    build:
+      context: .
+      args:
+        UID: ${UID:-1000}
+    image: atrader:local
+    # Host networking: the dashboard binds host loopback, so `tailscale serve` is the only way in,
+    # and requests proxied from loopback keep their real client address.
+    network_mode: host
+    depends_on:
+      postgres: { condition: service_healthy }
+    command: ${ATRADER_COMMAND:-serve --no-zyris}
+    environment:
+      ATRADER_HTTP_ADDR: 127.0.0.1:${ATRADER_HTTP_PORT:-8750}
+      DATABASE_URL_FILE: /run/secrets/database_url
+      ZYRIS_CREDENTIAL_FILE: /run/secrets/zyris_credential
+      KIS_APP_KEY_FILE: /run/secrets/kis_app_key
+      KIS_APP_SECRET_FILE: /run/secrets/kis_app_secret
+      DART_API_KEY_FILE: /run/secrets/dart_api_key
+      EDGAR_USER_AGENT: ${EDGAR_USER_AGENT:-}
+      RUST_LOG: ${RUST_LOG:-atrader=info,zyris_core=info}
+    secrets: [database_url, zyris_credential, kis_app_key, kis_app_secret, dart_api_key]
+    volumes: [state:/var/lib/atrader]
+    restart: unless-stopped
+
+# Each file may be empty; an empty secret counts as unset.
+secrets:
+  db_password: { file: ./secrets/db_password }
+  database_url: { file: ./secrets/database_url }
+  zyris_credential: { file: ./secrets/zyris_credential }
+  kis_app_key: { file: ./secrets/kis_app_key }
+  kis_app_secret: { file: ./secrets/kis_app_secret }
+  dart_api_key: { file: ./secrets/dart_api_key }
+
+volumes:
+  pgdata:
+  state:

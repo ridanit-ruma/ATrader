@@ -1,0 +1,8 @@
+target
+.dev
+.git
+result
+web/node_modules
+web/dist
+.playwright-mcp
+secrets

@@ -5,3 +5,5 @@ web/node_modules/
 web/dist/
 .playwright-mcp/
 result
+secrets/
+.env
