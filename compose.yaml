@@ -19,6 +19,9 @@ services:
   atrader:
     build:
       context: .
+      # Host networking for fetching crates and npm packages: a bridge with a larger MTU than the
+      # host link silently drops big TLS packets.
+      network: host
       args:
         UID: ${UID:-1000}
     image: atrader:local
