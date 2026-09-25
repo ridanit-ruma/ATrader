@@ -179,3 +179,42 @@ async fn accounts_are_managed_over_http(pool: PgPool) {
     let v: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(audit.into_body(), 100_000).await.unwrap()).unwrap();
     assert!(v.as_array().unwrap().iter().any(|e| e["action"] == "account_reset"));
 }
+
+#[sqlx::test]
+async fn keys_are_write_only_and_saving_asks_for_a_restart(pool: PgPool) {
+    let (app, _t) = common::rig(pool.clone()).await;
+    let auth = AuthStore(pool.clone());
+    let secret = new_totp_secret();
+    let uid = auth.create_user("ruma", &hash_password("long enough pass")).await.unwrap();
+    auth.set_totp(uid, Some(&secret), true).await.unwrap();
+    let dir = std::env::temp_dir().join(format!("atrader-web-keys-{}", std::process::id()));
+    let mut state = atrader::web::WebState::new(app, AuthStore(pool), false);
+    state.settings_dir = dir.clone();
+    let restart = state.restart.clone();
+    let r = atrader::web::router(state);
+    let c = login(&r, &secret).await;
+
+    let bad = r.clone().oneshot(req("PUT", "/api/settings/keys", Some(&c), Some(serde_json::json!({"DATABASE_URL": "x"})))).await.unwrap();
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+    let mock = r.clone().oneshot(req("PUT", "/api/settings/keys", Some(&c), Some(serde_json::json!({"KIS_ENV": "paper"})))).await.unwrap();
+    assert_eq!(mock.status(), StatusCode::BAD_REQUEST);
+
+    let ok = r.clone().oneshot(req("PUT", "/api/settings/keys", Some(&c), Some(serde_json::json!({"KIS_APP_KEY": "PSabc123", "KIS_ENV": "mock"})))).await.unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+    tokio::time::timeout(std::time::Duration::from_secs(1), restart.notified()).await.expect("restart requested");
+    assert_eq!(std::fs::read_to_string(dir.join("settings/KIS_APP_KEY")).unwrap(), "PSabc123");
+
+    let list = r.clone().oneshot(req("GET", "/api/settings/keys", Some(&c), None)).await.unwrap();
+    let body = axum::body::to_bytes(list.into_body(), 10_000).await.unwrap();
+    assert!(!String::from_utf8_lossy(&body).contains("PSabc123"), "secrets are never returned");
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let key = v.as_array().unwrap().iter().find(|k| k["name"] == "KIS_APP_KEY").unwrap();
+    assert_eq!((key["configured"].clone(), key["source"].clone()), (serde_json::json!(true), serde_json::json!("dashboard")));
+    let env = v.as_array().unwrap().iter().find(|k| k["name"] == "KIS_ENV").unwrap();
+    assert_eq!(env["value"], "mock", "non-secret settings are shown");
+
+    let zyris = r.clone().oneshot(req("GET", "/api/zyris", Some(&c), None)).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(zyris.into_body(), 10_000).await.unwrap()).unwrap();
+    assert_eq!(v["enrollment"]["status"], "idle");
+    std::fs::remove_dir_all(dir).unwrap();
+}

@@ -178,3 +178,26 @@ export interface AuditRow {
   detail: string;
   ip: string;
 }
+
+export interface KeySetting {
+  name: string;
+  secret: boolean;
+  configured: boolean;
+  source: "env" | "file" | "dashboard" | null;
+  value: string | null;
+}
+
+export interface Enrollment {
+  status: "idle" | "pending" | "granted" | "denied" | "expired" | "error";
+  user_code: string | null;
+  verification_uri: string | null;
+  expires_at: string | null;
+  message: string | null;
+}
+
+export interface ZyrisStatus {
+  connected: boolean;
+  enrolled: boolean;
+  source: "env" | "file" | "dashboard" | null;
+  enrollment: Enrollment;
+}

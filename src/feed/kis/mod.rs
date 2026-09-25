@@ -50,7 +50,7 @@ impl KisConfig {
     pub fn from_env() -> Option<KisConfig> {
         let app_key = crate::secret_env("KIS_APP_KEY")?;
         let app_secret = crate::secret_env("KIS_APP_SECRET")?;
-        let mock = std::env::var("KIS_ENV").is_ok_and(|v| v.eq_ignore_ascii_case("mock"));
+        let mock = crate::secret_env("KIS_ENV").is_some_and(|v| v.eq_ignore_ascii_case("mock"));
         Some(KisConfig { app_key: app_key.trim().into(), app_secret: app_secret.trim().into(), mock, state_dir: state_dir() })
     }
 
@@ -67,16 +67,7 @@ impl KisConfig {
     }
 }
 
-/// `$ATRADER_STATE_DIR`, else `$XDG_STATE_HOME/atrader`, else `~/.local/state/atrader`.
-pub fn state_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("ATRADER_STATE_DIR") {
-        return d.into();
-    }
-    if let Ok(d) = std::env::var("XDG_STATE_HOME") {
-        return Path::new(&d).join("atrader");
-    }
-    Path::new(&std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".local/state/atrader")
-}
+pub use crate::settings::state_dir;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CachedToken {

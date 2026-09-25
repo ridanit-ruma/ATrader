@@ -95,16 +95,16 @@ docker compose run --rm atrader user create <name>
 tailscale serve --bg --https=443 http://127.0.0.1:8750   # dashboard on your tailnet only
 ```
 
-To connect to Attacca, enroll the node: the command prints a code to approve in Attacca, then the
-credential, which goes into the secret file. Then switch the service to `serve`:
+Then connect Attacca and add data keys from the dashboard's settings page:
 
-```bash
-docker compose run --rm -T atrader zyris enroll > secrets/zyris_credential
-echo 'ATRADER_COMMAND=serve' >> .env && docker compose up -d
-```
+- **Attacca:** "연결 코드 받기" shows a code; approve it in Attacca and the server restarts
+  connected. (`atrader zyris enroll` does the same from a terminal and prints the credential.)
+- **Data keys:** KIS (Korean and US stocks), OpenDART and the SEC EDGAR User-Agent. They are
+  stored in the state directory (mode 0600), never shown again, and applied by a restart.
 
- KIS and DART keys go in
-`secrets/kis_app_key`, `secrets/kis_app_secret` and `secrets/dart_api_key` the same way.
+Keys set in the environment or in `./secrets` files take precedence and cannot be changed from the
+dashboard. The server exits with code 75 to restart; compose (`restart: unless-stopped`) and the
+NixOS module (`Restart=on-failure`) start it again.
 
 ## Deploying on NixOS
 

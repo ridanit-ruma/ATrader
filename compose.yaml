@@ -30,7 +30,7 @@ services:
     network_mode: host
     depends_on:
       postgres: { condition: service_healthy }
-    command: ${ATRADER_COMMAND:-serve --no-zyris}
+    command: ${ATRADER_COMMAND:-serve}
     environment:
       ATRADER_HTTP_ADDR: 127.0.0.1:${ATRADER_HTTP_PORT:-8750}
       DATABASE_URL_FILE: /run/secrets/database_url

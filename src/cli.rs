@@ -188,15 +188,10 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
     })
 }
 
-fn credential() -> anyhow::Result<String> {
-    crate::secret_env("ZYRIS_CREDENTIAL").ok_or_else(|| {
-        anyhow!("no zyris credential: set ZYRIS_CREDENTIAL (issue one in Attacca under /settings/zyris) or run `atrader serve --no-zyris`")
-    })
-}
 
 async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
     crate::init_tls();
-    let token = if with_zyris { Some(credential()?) } else { None };
+    let token = if with_zyris { crate::secret_env("ZYRIS_CREDENTIAL") } else { None };
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let calendar = Calendar::from_toml(include_str!("../holidays.toml"))?;
     let (journal_tx, journal_rx) = mpsc::unbounded_channel();
@@ -233,7 +228,7 @@ async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
     let writer = tokio::spawn(persist(journal_rx, store.clone(), bus.clone()));
     tokio::spawn(crate::app::bar_loop(bus.subscribe(), store.clone()));
     let dart = crate::secret_env("DART_API_KEY").map(crate::fundamentals::dart::DartClient::new);
-    let edgar = std::env::var("EDGAR_USER_AGENT").ok().filter(|u| !u.trim().is_empty()).map(|u| crate::fundamentals::edgar::EdgarClient::new(u.trim().into()));
+    let edgar = crate::secret_env("EDGAR_USER_AGENT").map(crate::fundamentals::edgar::EdgarClient::new);
     tracing::info!(dart = dart.is_some(), edgar = edgar.is_some(), "fundamentals sources");
     let app = Arc::new(App::new(broker.clone(), store, market, FxCache::new()).await?.with_fundamentals(dart, edgar).with_alerts(alert_tx));
     app.market.refresh_pins();
@@ -243,6 +238,7 @@ async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
     let addr: std::net::SocketAddr = std::env::var("ATRADER_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:8750".into()).parse().context("ATRADER_HTTP_ADDR")?;
     let web = crate::web::WebState::new(app.clone(), crate::web::auth::AuthStore(app.store.pool().clone()), true).with_bus(bus.clone());
     let zyris_connected = web.zyris_connected.clone();
+    let restart = web.restart.clone();
     tokio::spawn(async move {
         if let Err(e) = crate::web::serve_http(web, addr).await {
             tracing::error!(error = %e, "dashboard stopped");
@@ -259,12 +255,23 @@ async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
         }
     });
 
-    let Some(token) = token else {
-        tracing::info!("running without zyris; Ctrl-C or SIGTERM to stop");
-        shutdown_signal().await?;
-        return drain(&broker, writer).await;
+    // Ctrl-C, SIGTERM, or the dashboard asking for a restart to apply new keys.
+    let stop = async {
+        tokio::select! {
+            r = shutdown_signal() => r.map(|_| false),
+            _ = restart.notified() => Ok(true),
+        }
     };
-    let server = std::env::var("ZYRIS_SERVER_URL").unwrap_or_else(|_| zyris::DEFAULT_SERVER_URL.to_string());
+    let Some(token) = token else {
+        if with_zyris {
+            tracing::info!("Attacca is not connected yet; connect it from the dashboard settings");
+        } else {
+            tracing::info!("running without zyris; Ctrl-C or SIGTERM to stop");
+        }
+        let restart = stop.await?;
+        return finish(&broker, writer, restart).await;
+    };
+    let server = zyris_server();
     let name = std::env::var("ATRADER_NODE_NAME").unwrap_or_else(|_| "atrader".into());
     let link = zyris::Node::builder()
         .name(name)
@@ -281,26 +288,63 @@ async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
         })
         .build()?
         .connect(&server, &token)
-        .await?;
+        .await;
+    // A refused credential must not take the dashboard down with it: that is where it gets replaced.
+    let link = match link {
+        Ok(link) => link,
+        Err(e) => {
+            tracing::error!(error = %e, "could not connect to Attacca; reconnect it from the dashboard settings");
+            let restart = stop.await?;
+            return finish(&broker, writer, restart).await;
+        }
+    };
     tracing::info!(node = %link.node_id(), %server, "serving trader capability");
-    tokio::select! {
+    let restart = tokio::select! {
         closed = link.wait_closed() => {
             if let Err(e) = closed {
                 drain(&broker, writer).await?;
                 return Err(e.into());
             }
+            false
         }
-        signal = shutdown_signal() => {
-            signal?;
+        stopped = stop => {
+            let restart = stopped?;
             link.disconnect().await;
+            restart
         }
+    };
+    finish(&broker, writer, restart).await
+}
+
+/// Exit code asking the supervisor (compose `restart:`, systemd `Restart=on-failure`) to start us
+/// again, after the dashboard changed a setting that is read at startup.
+pub const RESTART_EXIT_CODE: i32 = 75;
+
+async fn finish(broker: &SimBroker, writer: tokio::task::JoinHandle<()>, restart: bool) -> anyhow::Result<()> {
+    drain(broker, writer).await?;
+    if restart {
+        tracing::info!("restarting to apply new settings");
+        std::process::exit(RESTART_EXIT_CODE);
     }
-    drain(&broker, writer).await
+    Ok(())
 }
 
 /// Scopes the credential is issued with; they never widen later. Alerts open a session with the
 /// account's agent and post to it.
 const ENROLL_SCOPES: [&str; 3] = ["agents:read", "sessions:read", "sessions:write"];
+
+pub fn zyris_server() -> String {
+    std::env::var("ZYRIS_SERVER_URL").unwrap_or_else(|_| zyris::DEFAULT_SERVER_URL.to_string())
+}
+
+pub fn enroll_request() -> zyris::EnrollRequest {
+    zyris::EnrollRequest {
+        program: "atrader".into(),
+        system_hint: zyris::machine_name().unwrap_or_default(),
+        platform: std::env::consts::OS.into(),
+        scopes: ENROLL_SCOPES.iter().map(|s| s.to_string()).collect(),
+    }
+}
 
 /// Device-grant enrollment: show a code on stderr, wait for approval in Attacca, print the
 /// credential on stdout. A lapsed code is replaced with a fresh one until someone answers.
@@ -308,14 +352,8 @@ fn zyris_enroll() -> anyhow::Result<()> {
     crate::init_tls();
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async {
-        let server = std::env::var("ZYRIS_SERVER_URL").unwrap_or_else(|_| zyris::DEFAULT_SERVER_URL.to_string());
-        let request = zyris::EnrollRequest {
-            program: "atrader".into(),
-            system_hint: zyris::machine_name().unwrap_or_default(),
-            platform: std::env::consts::OS.into(),
-            scopes: ENROLL_SCOPES.iter().map(|s| s.to_string()).collect(),
-        };
-        let mut enrollment = zyris::enroll(&server, request).await?;
+        let server = zyris_server();
+        let mut enrollment = zyris::enroll(&server, enroll_request()).await?;
         loop {
             let code = enrollment.code();
             eprintln!("Approve this node in Attacca: open {} and enter {}", code.verification_uri, code.user_code);

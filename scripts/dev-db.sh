@@ -2,7 +2,7 @@
 # Start a throwaway local Postgres (from nixpkgs) for development and tests.
 set -euo pipefail
 DIR="$(cd "$(dirname "$0")/.." && pwd)/.dev/pg"
-PORT=54329
+PORT="${ATRADER_DEV_DB_PORT:-54329}"
 run() { nix shell nixpkgs#postgresql_16 -c "$@"; }
 if [ ! -d "$DIR" ]; then
   run initdb -D "$DIR" -U atrader --auth=trust >/dev/null

@@ -11,6 +11,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { TableCell, TableRow } from "@/components/ui/table";
+import { AttaccaConnection, DataKeys } from "@/pages/Connections";
 
 const CURRENCIES = ["KRW", "USD", "USDT"] as const;
 
@@ -234,6 +235,8 @@ export function Settings() {
   return (
     <div className="grid gap-4">
       <PageHeader title="설정" description="계좌, 보안, 표시 설정" />
+      <AttaccaConnection />
+      <DataKeys />
       <CreateAccount />
       <ResetAccount />
       <Status />

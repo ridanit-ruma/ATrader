@@ -41,12 +41,44 @@ pub struct WebState {
     pub cookie_secure: bool,
     /// Set by the zyris link's `on_connect`.
     pub zyris_connected: Arc<AtomicBool>,
+    /// Signalled when a saved setting needs a restart to take effect (see `cli::RESTART_EXIT_CODE`).
+    pub restart: Arc<tokio::sync::Notify>,
+    /// Where dashboard-entered keys are stored (`<dir>/settings/NAME`).
+    pub settings_dir: std::path::PathBuf,
+    pub enrollment: Arc<Mutex<EnrollView>>,
+}
+
+/// Where the dashboard's Attacca enrollment stands.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EnrollView {
+    /// `idle`, `pending`, `granted`, `denied`, `expired` or `error`.
+    pub status: &'static str,
+    pub user_code: Option<String>,
+    pub verification_uri: Option<String>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub message: Option<String>,
+}
+
+impl Default for EnrollView {
+    fn default() -> Self {
+        EnrollView { status: "idle", user_code: None, verification_uri: None, expires_at: None, message: None }
+    }
 }
 
 impl WebState {
     pub fn new(app: Arc<App>, auth: AuthStore, cookie_secure: bool) -> Self {
         let (bus, _) = broadcast::channel(16);
-        WebState { app, auth: Arc::new(auth), limiter: Arc::default(), bus, cookie_secure, zyris_connected: Arc::default() }
+        WebState {
+            app,
+            auth: Arc::new(auth),
+            limiter: Arc::default(),
+            bus,
+            cookie_secure,
+            zyris_connected: Arc::default(),
+            restart: Arc::default(),
+            settings_dir: crate::settings::state_dir(),
+            enrollment: Arc::default(),
+        }
     }
 
     pub fn with_bus(mut self, bus: broadcast::Sender<BusEvent>) -> Self {
@@ -540,6 +572,118 @@ async fn health(State(s): State<WebState>, headers: HeaderMap) -> ApiResult {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Settings: data keys and the Attacca link
+
+async fn keys(State(s): State<WebState>, headers: HeaderMap) -> ApiResult {
+    authed(&s, &headers, false).await?;
+    let rows = crate::settings::EDITABLE
+        .iter()
+        .map(|k| {
+            let source = crate::settings::source_in(&s.settings_dir, k.name);
+            let value = (!k.secret).then(|| crate::settings::get_in(&s.settings_dir, k.name)).flatten();
+            json!({"name": k.name, "secret": k.secret, "configured": source.is_some(), "source": source, "value": value})
+        })
+        .collect();
+    Ok(Json(Value::Array(rows)))
+}
+
+async fn save_keys(State(s): State<WebState>, peer: Peer, headers: HeaderMap, Json(b): Json<HashMap<String, String>>) -> ApiResult {
+    let (user, _) = authed(&s, &headers, false).await?;
+    if b.is_empty() {
+        return Err(bad_request("nothing to save"));
+    }
+    for (name, value) in &b {
+        if !crate::settings::EDITABLE.iter().any(|k| k.name == name) {
+            return Err(bad_request(format!("{name} cannot be set from the dashboard")));
+        }
+        if matches!(crate::settings::source_in(&s.settings_dir, name), Some(crate::settings::Source::Env | crate::settings::Source::File)) {
+            return Err(ApiError(StatusCode::CONFLICT, "set_by_operator", format!("{name} is set in the server's environment; change it there")));
+        }
+        let v = value.trim();
+        if v.len() > 4096 || v.contains(['\n', '\r']) {
+            return Err(bad_request(format!("{name} must be one line")));
+        }
+        if name == "KIS_ENV" && !matches!(v, "" | "real" | "mock") {
+            return Err(bad_request("KIS_ENV is real or mock"));
+        }
+    }
+    for (name, value) in &b {
+        crate::settings::save_in(&s.settings_dir, name, value).map_err(internal)?;
+    }
+    let mut names: Vec<&str> = b.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    let _ = s.auth.audit(Some(user.id), "settings_changed", &names.join(","), &peer_ip(&headers, peer)).await;
+    s.restart.notify_one();
+    Ok(Json(json!({"restarting": true})))
+}
+
+async fn zyris_status(State(s): State<WebState>, headers: HeaderMap) -> ApiResult {
+    authed(&s, &headers, false).await?;
+    let source = crate::settings::source_in(&s.settings_dir, "ZYRIS_CREDENTIAL");
+    let enrollment = s.enrollment.lock().unwrap().clone();
+    Ok(Json(json!({
+        "connected": s.zyris_connected.load(Ordering::Relaxed),
+        "enrolled": source.is_some(),
+        "source": source,
+        "enrollment": enrollment,
+    })))
+}
+
+/// Start a device-grant enrollment (or return the one in progress). Approval stores the
+/// credential and restarts the server so it connects with it.
+async fn zyris_enroll(State(s): State<WebState>, peer: Peer, headers: HeaderMap) -> ApiResult {
+    let (user, _) = authed(&s, &headers, false).await?;
+    if matches!(crate::settings::source_in(&s.settings_dir, "ZYRIS_CREDENTIAL"), Some(crate::settings::Source::Env | crate::settings::Source::File)) {
+        return Err(ApiError(StatusCode::CONFLICT, "set_by_operator", "the Attacca credential is set in the server's environment; change it there".into()));
+    }
+    {
+        let current = s.enrollment.lock().unwrap();
+        if current.status == "pending" && current.expires_at.is_some_and(|t| t > Utc::now()) {
+            return Ok(Json(to_json(&*current)?));
+        }
+    }
+    let mut enrollment = zyris::enroll(&crate::cli::zyris_server(), crate::cli::enroll_request())
+        .await
+        .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, "upstream", format!("Attacca did not issue a code: {e}")))?;
+    let code = enrollment.code().clone();
+    let view = EnrollView {
+        status: "pending",
+        user_code: Some(code.user_code),
+        verification_uri: Some(code.verification_uri),
+        expires_at: Some(DateTime::<Utc>::from(code.expires_at)),
+        message: None,
+    };
+    *s.enrollment.lock().unwrap() = view.clone();
+    let ip = peer_ip(&headers, peer);
+    let st = s.clone();
+    tokio::spawn(async move {
+        let outcome = enrollment.wait().await;
+        let mut v = st.enrollment.lock().unwrap().clone();
+        v.user_code = None;
+        match outcome {
+            Ok(credential) => match crate::settings::save_in(&st.settings_dir, "ZYRIS_CREDENTIAL", credential.secret()) {
+                Ok(()) => {
+                    v.status = "granted";
+                    *st.enrollment.lock().unwrap() = v;
+                    let _ = st.auth.audit(Some(user.id), "zyris_enrolled", "", &ip).await;
+                    st.restart.notify_one();
+                    return;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "could not store the zyris credential");
+                    (v.status, v.message) = ("error", Some("could not store the credential".into()));
+                }
+            },
+            Err(zyris::EnrollError::Lapsed) => v.status = "expired",
+            Err(zyris::EnrollError::Denied) => v.status = "denied",
+            Err(e) => (v.status, v.message) = ("error", Some(e.to_string())),
+        }
+        *st.enrollment.lock().unwrap() = v;
+    });
+    Ok(Json(to_json(view)?))
+}
+
+// ---------------------------------------------------------------------------------------------
 // Live stream
 
 fn event(name: &str, v: impl serde::Serialize) -> Option<Event> {
@@ -654,6 +798,9 @@ pub fn router(state: WebState) -> Router {
         .route("/api/accounts/{id}/alerts", get(alerts))
         .route("/api/instruments/{id}/chart", get(chart))
         .route("/api/health", get(health))
+        .route("/api/settings/keys", get(keys).put(save_keys))
+        .route("/api/zyris", get(zyris_status))
+        .route("/api/zyris/enroll", post(zyris_enroll))
         .route("/api/stream", get(stream))
         .fallback(static_file)
         .layer(middleware::from_fn(guard))

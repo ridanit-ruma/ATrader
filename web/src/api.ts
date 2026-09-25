@@ -55,4 +55,28 @@ export const api = {
   chart: (id: string, interval: string, account?: string) =>
     get<T.Chart>(`/api/instruments/${enc(id)}/chart?interval=${interval}&limit=300${account ? `&account=${enc(account)}` : ""}`),
   health: () => get<T.Health>("/api/health"),
+  keys: () => get<T.KeySetting[]>("/api/settings/keys"),
+  saveKeys: (values: Record<string, string>) => call<{ restarting: boolean }>("PUT", "/api/settings/keys", values),
+  zyris: () => get<T.ZyrisStatus>("/api/zyris"),
+  zyrisEnroll: () => post<T.Enrollment>("/api/zyris/enroll"),
 };
+
+/** Wait for the server to go down and come back after it restarts to apply settings. Gives up
+ * waiting for the drop after 20 s (it may have restarted between two polls). */
+export async function waitForRestart(): Promise<void> {
+  const up = async () => {
+    try {
+      await api.me();
+      return true;
+    } catch (e) {
+      return e instanceof ApiError && e.status < 500;
+    }
+  };
+  let wentDown = false;
+  for (let i = 0; i < 90; i++) {
+    await new Promise((r) => setTimeout(r, 1000));
+    const ok = await up();
+    if (!ok) wentDown = true;
+    else if (wentDown || i >= 20) return;
+  }
+}
