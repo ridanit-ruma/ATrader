@@ -46,8 +46,10 @@ export DATABASE_URL=postgres://atrader@127.0.0.1:54329/atrader
 atrader account create bot "Momentum bot" --agent <attacca-agent-id> --cash KRW=10000000 --cash USDT=7000
 atrader account list
 
-# Serve the zyris `trader` capability. Issue the credential in Attacca under /settings/zyris.
-ZYRIS_CREDENTIAL=zc_... atrader serve
+# Serve the zyris `trader` capability. `zyris enroll` prints a code to approve in Attacca, then
+# the credential.
+atrader zyris enroll > zyris.credential
+ZYRIS_CREDENTIAL_FILE=zyris.credential atrader serve
 
 # Or run the simulator and market data without connecting to Attacca.
 atrader serve --no-zyris
@@ -93,8 +95,15 @@ docker compose run --rm atrader user create <name>
 tailscale serve --bg --https=443 http://127.0.0.1:8750   # dashboard on your tailnet only
 ```
 
-To connect to Attacca, write the `zc_` credential into `secrets/zyris_credential`, set
-`ATRADER_COMMAND=serve` in `.env`, and run `docker compose up -d`. KIS and DART keys go in
+To connect to Attacca, enroll the node: the command prints a code to approve in Attacca, then the
+credential, which goes into the secret file. Then switch the service to `serve`:
+
+```bash
+docker compose run --rm -T atrader zyris enroll > secrets/zyris_credential
+echo 'ATRADER_COMMAND=serve' >> .env && docker compose up -d
+```
+
+ KIS and DART keys go in
 `secrets/kis_app_key`, `secrets/kis_app_secret` and `secrets/dart_api_key` the same way.
 
 ## Deploying on NixOS

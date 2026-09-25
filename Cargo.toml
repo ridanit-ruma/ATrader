@@ -32,7 +32,7 @@ totp-rs = { version = "5", features = ["otpauth", "gen_secret"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
-zyris = { git = "https://github.com/attacca-cc/zyris-protocol", rev = "4614f0ea16f646408df590c0b249bd34c7a05d69", version = "0.2.0", features = ["tls-ring"] }
+zyris = { git = "https://github.com/attacca-cc/zyris-protocol", rev = "4614f0ea16f646408df590c0b249bd34c7a05d69", version = "0.2.0", features = ["tls-ring", "enroll"] }
 zyris-attacca = { git = "https://github.com/attacca-cc/zyris-protocol", rev = "4614f0ea16f646408df590c0b249bd34c7a05d69", version = "0.2.0" }
 
 [dev-dependencies]

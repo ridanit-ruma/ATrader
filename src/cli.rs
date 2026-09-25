@@ -29,6 +29,8 @@ USAGE:
   atrader account reset <id> [--cash KRW=10000000]...
   atrader user create <username>
   atrader user reset-2fa <username>
+  atrader zyris enroll    get a zyris credential: approve the printed code in Attacca; the
+                          credential is printed on stdout, e.g. `> secrets/zyris_credential`
 
 ENVIRONMENT:
   DATABASE_URL          Postgres connection string (required)
@@ -52,6 +54,7 @@ pub enum Command {
     AccountReset { id: String, cash: Vec<(Currency, Decimal)> },
     UserCreate { username: String },
     UserReset2fa { username: String },
+    ZyrisEnroll,
     Version,
     Help,
 }
@@ -99,6 +102,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         }
         ["user", "create", name] => Ok(Command::UserCreate { username: name.to_string() }),
         ["user", "reset-2fa", name] => Ok(Command::UserReset2fa { username: name.to_string() }),
+        ["zyris", "enroll"] => Ok(Command::ZyrisEnroll),
         ["account", "reset", id, ..] => {
             let (agent, cash) = parse_flags(&args[3..])?;
             if agent.is_some() {
@@ -121,6 +125,8 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
             println!("atrader {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
+        // Before logging starts: stdout carries only the credential.
+        Command::ZyrisEnroll => return zyris_enroll(),
         _ => {}
     }
     tracing_subscriber::fmt()
@@ -176,7 +182,7 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
                 println!("account {id} reset (generation {generation}); start `atrader serve` again to trade it");
             }
             Command::Serve { zyris } => serve(store, zyris).await?,
-            Command::Help | Command::Version => unreachable!("handled above"),
+            Command::Help | Command::Version | Command::ZyrisEnroll => unreachable!("handled above"),
         }
         Ok(())
     })
@@ -292,6 +298,43 @@ async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
     drain(&broker, writer).await
 }
 
+/// Scopes the credential is issued with; they never widen later. Alerts open a session with the
+/// account's agent and post to it.
+const ENROLL_SCOPES: [&str; 3] = ["agents:read", "sessions:read", "sessions:write"];
+
+/// Device-grant enrollment: show a code on stderr, wait for approval in Attacca, print the
+/// credential on stdout. A lapsed code is replaced with a fresh one until someone answers.
+fn zyris_enroll() -> anyhow::Result<()> {
+    crate::init_tls();
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    rt.block_on(async {
+        let server = std::env::var("ZYRIS_SERVER_URL").unwrap_or_else(|_| zyris::DEFAULT_SERVER_URL.to_string());
+        let request = zyris::EnrollRequest {
+            program: "atrader".into(),
+            system_hint: zyris::machine_name().unwrap_or_default(),
+            platform: std::env::consts::OS.into(),
+            scopes: ENROLL_SCOPES.iter().map(|s| s.to_string()).collect(),
+        };
+        let mut enrollment = zyris::enroll(&server, request).await?;
+        loop {
+            let code = enrollment.code();
+            eprintln!("Approve this node in Attacca: open {} and enter {}", code.verification_uri, code.user_code);
+            match enrollment.wait().await {
+                Ok(credential) => {
+                    println!("{}", credential.secret());
+                    eprintln!("Enrolled. The credential on stdout never expires; keep it secret.");
+                    return Ok(());
+                }
+                Err(zyris::EnrollError::Lapsed) => {
+                    eprintln!("The code expired; here is a new one.");
+                    enrollment.renew().await?;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    })
+}
+
 /// Ctrl-C or SIGTERM (what systemd sends on stop).
 async fn shutdown_signal() -> anyhow::Result<()> {
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -347,6 +390,7 @@ mod tests {
         assert_eq!(parse(&args(&["user", "create", "ruma"])), Ok(Command::UserCreate { username: "ruma".into() }));
         assert_eq!(parse(&args(&["user", "reset-2fa", "ruma"])), Ok(Command::UserReset2fa { username: "ruma".into() }));
         assert!(parse(&args(&["user", "create"])).is_err());
+        assert_eq!(parse(&args(&["zyris", "enroll"])), Ok(Command::ZyrisEnroll));
     }
 
     #[test]
