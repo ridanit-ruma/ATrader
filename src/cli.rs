@@ -280,7 +280,7 @@ async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
     let link = zyris::Node::builder()
         .name(name)
         .kind(zyris::NodeKind::Service)
-        .capability(TraderServer(TraderTools::new(app)))
+        .capability(crate::tools::Portable(TraderServer(TraderTools::new(app))))
         .on_connect({
             let slot = slot.clone();
             move |conn| {

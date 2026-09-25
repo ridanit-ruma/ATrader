@@ -10,6 +10,8 @@ use serde_json::json;
 use zyris::{ErrorCode, Payload};
 
 pub use dto::*;
+pub mod schema;
+pub use schema::{Portable, portable};
 
 use crate::app::{App, value_account};
 use crate::broker::{OrderError, OrderRequest, OrderType, Tif};

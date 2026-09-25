@@ -413,3 +413,56 @@ async fn accounts_are_created_and_reset_live(pool: PgPool) {
     assert_eq!(app.store.fills("fresh", 1, None, 10).await.unwrap().len(), 1);
     assert_eq!(app.store.fills("fresh", 2, None, 10).await.unwrap().len(), 1);
 }
+
+/// Every tool schema must be plain enough for any LLM tool API: no references, no type unions,
+/// no nullable anyOf, no non-standard formats, and every object lists its properties.
+#[test]
+fn announced_schemas_are_portable() {
+    fn check(v: &serde_json::Value, tool: &str, path: &str) {
+        match v {
+            serde_json::Value::Object(m) => {
+                for bad in ["$ref", "$defs", "$schema", "anyOf", "oneOf", "allOf", "title"] {
+                    assert!(!m.contains_key(bad), "{tool}{path}: has {bad}");
+                }
+                if let Some(t) = m.get("type") {
+                    assert!(t.is_string(), "{tool}{path}: type union {t}");
+                    if t == "object" {
+                        assert!(m.contains_key("properties"), "{tool}{path}: object without properties");
+                    }
+                    if t == "number" || t == "integer" {
+                        assert!(!m.contains_key("pattern"), "{tool}{path}: pattern on a number");
+                    }
+                }
+                if let Some(f) = m.get("format") {
+                    assert_eq!(f, "date-time", "{tool}{path}: format {f}");
+                }
+                assert_ne!(m.get("default"), Some(&serde_json::Value::Null), "{tool}{path}: default null");
+                for (k, x) in m {
+                    match (k.as_str(), x) {
+                        // Field names, not keywords: check each field's schema.
+                        ("properties", serde_json::Value::Object(fields)) => {
+                            fields.iter().for_each(|(f, s)| check(s, tool, &format!("{path}/properties/{f}")))
+                        }
+                        _ => check(x, tool, &format!("{path}/{k}")),
+                    }
+                }
+            }
+            serde_json::Value::Array(a) => a.iter().for_each(|x| check(x, tool, path)),
+            _ => {}
+        }
+    }
+    let d = atrader::tools::portable(atrader::tools::trader_capability());
+    assert!(d.tools.len() > 20);
+    for t in &d.tools {
+        check(&t.request_schema, &t.name, "");
+        check(t.response_schema.as_ref().unwrap(), &t.name, "(response)");
+    }
+    let order = d.tools.iter().find(|t| t.name == "place_order").unwrap();
+    let qty = &order.request_schema["properties"]["order"]["properties"]["qty"];
+    assert_eq!(qty["type"], "number", "decimals are numbers: {qty}");
+    let side = &order.request_schema["properties"]["order"]["properties"]["side"];
+    assert_eq!(side["enum"], serde_json::json!(["buy", "sell"]), "enums are inlined: {side}");
+    // What the schema now asks for (plain numbers) must decode exactly.
+    let o: OrderInput = serde_json::from_value(serde_json::json!({"account": "bot", "instrument": "UPBIT:KRW-BTC", "side": "buy", "kind": "limit", "qty": 0.1, "limit_price": 99999000, "reason": "r"})).unwrap();
+    assert_eq!((o.qty, o.limit_price), (Some(dec!(0.1)), Some(dec!(99999000))));
+}
