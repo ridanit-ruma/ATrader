@@ -10,4 +10,7 @@ mkdir -p secrets
 for f in zyris_credential kis_app_key kis_app_secret dart_api_key; do
   [ -e "secrets/$f" ] || : > "secrets/$f"
 done
+# The postgres container reads its password as its own user; the 0700 directory still keeps
+# other host users out.
+chmod 644 secrets/db_password
 echo "secrets ready in $(pwd)/secrets"
