@@ -12,6 +12,7 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { TableCell, TableRow } from "@/components/ui/table";
 import { AttaccaConnection, DataKeys } from "@/pages/Connections";
+import { AgentPicker } from "@/components/AgentPicker";
 
 const CURRENCIES = ["KRW", "USD", "USDT"] as const;
 
@@ -61,7 +62,10 @@ function CreateAccount() {
         <div className="grid gap-2 md:grid-cols-3">
           <Field id="new-id" label="id (a-z, 0-9, _, -)" value={f.id} onChange={(e) => setF({ ...f, id: e.target.value })} required />
           <Field id="new-name" label="이름" value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} required />
-          <Field id="new-agent" label="Attacca 에이전트 id (선택)" value={f.agent} onChange={(e) => setF({ ...f, agent: e.target.value })} />
+          <div className="grid gap-2">
+            <Label htmlFor="new-agent">거래할 에이전트</Label>
+            <AgentPicker id="new-agent" value={f.agent} onChange={(agent) => setF({ ...f, agent })} />
+          </div>
         </div>
         <CashInputs prefix="new" cash={cash} onChange={setCash} />
         <ErrorText error={m.error} />

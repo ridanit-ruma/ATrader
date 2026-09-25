@@ -241,6 +241,8 @@ async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
 
     let addr: std::net::SocketAddr = std::env::var("ATRADER_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:8750".into()).parse().context("ATRADER_HTTP_ADDR")?;
     let web = crate::web::WebState::new(app.clone(), crate::web::auth::AuthStore(app.store.pool().clone()), true).with_bus(bus.clone());
+    let mut web = web;
+    web.attacca = slot.clone();
     let zyris_connected = web.zyris_connected.clone();
     let restart = web.restart.clone();
     tokio::spawn(async move {

@@ -61,6 +61,11 @@ impl App {
         Ok(generation)
     }
 
+    pub async fn set_account_agent(&self, id: &str, agent: Option<&str>) -> anyhow::Result<()> {
+        anyhow::ensure!(self.store.set_account_agent(id, agent).await?, "no account {id:?}");
+        self.reload_accounts().await
+    }
+
     pub async fn reload_accounts(&self) -> anyhow::Result<()> {
         let rows = self.store.list_accounts().await?;
         *self.accounts.write().unwrap() = rows.into_iter().map(|r| (r.id.clone(), r)).collect();

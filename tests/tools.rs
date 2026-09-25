@@ -466,3 +466,14 @@ fn announced_schemas_are_portable() {
     let o: OrderInput = serde_json::from_value(serde_json::json!({"account": "bot", "instrument": "UPBIT:KRW-BTC", "side": "buy", "kind": "limit", "qty": 0.1, "limit_price": 99999000, "reason": "r"})).unwrap();
     assert_eq!((o.qty, o.limit_price), (Some(dec!(0.1)), Some(dec!(99999000))));
 }
+
+#[sqlx::test]
+async fn giving_an_account_to_an_agent_shows_it_and_forgets_the_alert_session(pool: PgPool) {
+    let (app, t) = rig(pool).await;
+    assert!(!t.list_accounts().await.unwrap().iter().any(|a| a.id == "manual"));
+    app.store.set_alert_session("manual", "old-session").await.unwrap();
+    app.set_account_agent("manual", Some("agent-2")).await.unwrap();
+    assert!(t.list_accounts().await.unwrap().iter().any(|a| a.id == "manual"));
+    assert_eq!(app.store.alert_session("manual").await.unwrap(), None, "the old agent's session is not reused");
+    assert!(app.set_account_agent("nope", None).await.is_err());
+}

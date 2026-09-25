@@ -513,6 +513,13 @@ impl Store {
         Ok(())
     }
 
+    /// Hand the account to another agent (or none). The alert session belonged to the old agent,
+    /// so it is forgotten. False when there is no such account.
+    pub async fn set_account_agent(&self, account: &str, agent: Option<&str>) -> sqlx::Result<bool> {
+        let r = sqlx::query("UPDATE accounts SET agent_id = $2, alert_session_id = NULL WHERE id = $1").bind(account).bind(agent).execute(&self.pool).await?;
+        Ok(r.rows_affected() == 1)
+    }
+
     pub async fn alert_session(&self, account: &str) -> sqlx::Result<Option<String>> {
         sqlx::query_scalar("SELECT alert_session_id FROM accounts WHERE id = $1").bind(account).fetch_one(&self.pool).await
     }

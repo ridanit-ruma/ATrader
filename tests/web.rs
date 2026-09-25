@@ -218,3 +218,25 @@ async fn keys_are_write_only_and_saving_asks_for_a_restart(pool: PgPool) {
     assert_eq!(v["enrollment"]["status"], "idle");
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[sqlx::test]
+async fn an_account_can_be_given_to_an_agent_later(pool: PgPool) {
+    let (r, _, secret) = web(pool).await;
+    let c = login(&r, &secret).await;
+    // Not connected to Attacca in tests: the agent list says so instead of failing opaquely.
+    let agents = r.clone().oneshot(req("GET", "/api/agents", Some(&c), None)).await.unwrap();
+    assert_eq!(agents.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let missing = r.clone().oneshot(req("PUT", "/api/accounts/nope/agent", Some(&c), Some(serde_json::json!({"agent_id": "ag-2"})))).await.unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    let set = r.clone().oneshot(req("PUT", "/api/accounts/manual/agent", Some(&c), Some(serde_json::json!({"agent_id": "ag-2"})))).await.unwrap();
+    assert_eq!(set.status(), StatusCode::OK);
+    let detail = r.clone().oneshot(req("GET", "/api/accounts/manual", Some(&c), None)).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(detail.into_body(), 100_000).await.unwrap()).unwrap();
+    assert_eq!(v["agent_id"], "ag-2");
+    let clear = r.clone().oneshot(req("PUT", "/api/accounts/manual/agent", Some(&c), Some(serde_json::json!({"agent_id": null})))).await.unwrap();
+    assert_eq!(clear.status(), StatusCode::OK);
+    let detail = r.clone().oneshot(req("GET", "/api/accounts/manual", Some(&c), None)).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(detail.into_body(), 100_000).await.unwrap()).unwrap();
+    assert_eq!(v["agent_id"], serde_json::Value::Null);
+}

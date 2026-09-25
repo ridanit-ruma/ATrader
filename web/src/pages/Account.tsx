@@ -1,6 +1,8 @@
 import { useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { AgentPicker } from "@/components/AgentPicker";
+import { Button } from "@/components/ui/button";
 import { Link, useParams } from "react-router";
-import { useQuery } from "@tanstack/react-query";
 import { api } from "@/api";
 import { fmtKrw, fmtNum, fmtPct, fmtTime } from "@/format";
 import { EquityChart, PnlBars } from "@/components/charts";
@@ -30,7 +32,9 @@ export function Account() {
 
   return (
     <div className="grid gap-4">
-      <PageHeader title={d.summary.name} description={`${id} · ${d.agent_id ? `에이전트 ${d.agent_id}` : "에이전트 없음"} · 세대 ${d.generation}`} />
+      <PageHeader title={d.summary.name} description={`${id} · 세대 ${d.generation}`}>
+        <AgentControl id={id} current={d.agent_id ?? ""} />
+      </PageHeader>
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <Metric
           label="평가금액 (원)"
@@ -152,6 +156,32 @@ export function Account() {
           ))}
         </DataTable>
       </Section>
+    </div>
+  );
+}
+
+/** Which agent trades this account; saving hands it over. */
+function AgentControl({ id, current }: { id: string; current: string }) {
+  const qc = useQueryClient();
+  const [agent, setAgent] = useState(current);
+  const save = useMutation({
+    mutationFn: () => api.setAgent(id, agent.trim() || null),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["account", id] });
+      qc.invalidateQueries({ queryKey: ["overview"] });
+    },
+  });
+  return (
+    <div className="grid gap-1">
+      <div className="flex items-center gap-2">
+        <div className="w-56">
+          <AgentPicker value={agent} onChange={setAgent} />
+        </div>
+        <Button variant="outline" disabled={agent === current || save.isPending} onClick={() => save.mutate()}>
+          에이전트 지정
+        </Button>
+      </div>
+      <ErrorText error={save.error} />
     </div>
   );
 }

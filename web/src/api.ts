@@ -55,6 +55,8 @@ export const api = {
   chart: (id: string, interval: string, account?: string) =>
     get<T.Chart>(`/api/instruments/${enc(id)}/chart?interval=${interval}&limit=300${account ? `&account=${enc(account)}` : ""}`),
   health: () => get<T.Health>("/api/health"),
+  agents: () => get<T.Agent[]>("/api/agents"),
+  setAgent: (id: string, agent_id: string | null) => call("PUT", `/api/accounts/${enc(id)}/agent`, { agent_id }),
   keys: () => get<T.KeySetting[]>("/api/settings/keys"),
   saveKeys: (values: Record<string, string>) => call<{ restarting: boolean }>("PUT", "/api/settings/keys", values),
   zyris: () => get<T.ZyrisStatus>("/api/zyris"),

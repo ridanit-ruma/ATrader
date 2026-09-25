@@ -201,3 +201,9 @@ export interface ZyrisStatus {
   source: "env" | "file" | "dashboard" | null;
   enrollment: Enrollment;
 }
+
+export interface Agent {
+  id: string;
+  name: string;
+  description: string | null;
+}

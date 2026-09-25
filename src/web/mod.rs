@@ -13,7 +13,7 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Extension, Json, Router};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use futures_util::{Stream, StreamExt, stream};
@@ -46,6 +46,8 @@ pub struct WebState {
     /// Where dashboard-entered keys are stored (`<dir>/settings/NAME`).
     pub settings_dir: std::path::PathBuf,
     pub enrollment: Arc<Mutex<EnrollView>>,
+    /// The live Attacca connection (set by the zyris link), for listing agents.
+    pub attacca: crate::alerts::deliver::ConnSlot,
 }
 
 /// Where the dashboard's Attacca enrollment stands.
@@ -78,6 +80,7 @@ impl WebState {
             restart: Arc::default(),
             settings_dir: crate::settings::state_dir(),
             enrollment: Arc::default(),
+            attacca: Default::default(),
         }
     }
 
@@ -426,6 +429,34 @@ async fn reset_account(State(s): State<WebState>, peer: Peer, headers: HeaderMap
     let generation = s.app.reset_account(&id, &cash).await.map_err(internal)?;
     let _ = s.auth.audit(Some(user.id), "account_reset", &id, &peer_ip(&headers, peer)).await;
     Ok(Json(json!({"id": id, "generation": generation})))
+}
+
+/// The Attacca agents this node's credential can see, to pick an account's agent from.
+async fn agents(State(s): State<WebState>, headers: HeaderMap) -> ApiResult {
+    use zyris_attacca::{AttaccaApi, AttaccaApiClient};
+    authed(&s, &headers, false).await?;
+    let unavailable = |m: String| ApiError(StatusCode::SERVICE_UNAVAILABLE, "not_connected", m);
+    let conn = s.attacca.get().ok_or_else(|| unavailable("not connected to Attacca".into()))?;
+    let api = conn.wait_capability::<AttaccaApiClient>(std::time::Duration::from_secs(5)).await.map_err(|e| unavailable(e.to_string()))?;
+    let list = api.list_agents().await.map_err(|e| ApiError(StatusCode::BAD_GATEWAY, "upstream", e.message))?;
+    Ok(Json(Value::Array(list.into_iter().map(|a| json!({"id": a.id, "name": a.name, "description": a.description})).collect())))
+}
+
+#[derive(Deserialize)]
+struct AgentBody {
+    agent_id: Option<String>,
+}
+
+async fn set_agent(State(s): State<WebState>, peer: Peer, headers: HeaderMap, Path(id): Path<String>, Json(b): Json<AgentBody>) -> ApiResult {
+    let (user, _) = authed(&s, &headers, false).await?;
+    row(&s, &id)?;
+    let agent = b.agent_id.as_deref().map(str::trim).filter(|a| !a.is_empty());
+    if agent.is_some_and(|a| a.len() > 128 || a.chars().any(char::is_control)) {
+        return Err(bad_request("agent id is too long or has control characters"));
+    }
+    s.app.set_account_agent(&id, agent).await.map_err(internal)?;
+    let _ = s.auth.audit(Some(user.id), "account_agent", &format!("{id} -> {}", agent.unwrap_or("-")), &peer_ip(&headers, peer)).await;
+    Ok(Json(json!({"id": id, "agent_id": agent})))
 }
 
 fn kst_midnight(now: DateTime<Utc>) -> DateTime<Utc> {
@@ -791,6 +822,8 @@ pub fn router(state: WebState) -> Router {
         .route("/api/accounts", post(create_account))
         .route("/api/accounts/{id}", get(account))
         .route("/api/accounts/{id}/reset", post(reset_account))
+        .route("/api/accounts/{id}/agent", put(set_agent))
+        .route("/api/agents", get(agents))
         .route("/api/accounts/{id}/equity", get(equity))
         .route("/api/accounts/{id}/fills", get(fills))
         .route("/api/accounts/{id}/orders", get(orders))
