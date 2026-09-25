@@ -5,6 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 umask 077
 mkdir -p secrets
+chmod 700 secrets
 [ -s secrets/db_password ] || head -c 24 /dev/urandom | base64 | tr -d '/+=' > secrets/db_password
 [ -s secrets/database_url ] || echo "postgres://atrader:$(cat secrets/db_password)@127.0.0.1:${ATRADER_DB_PORT:-54330}/atrader" > secrets/database_url
 for f in zyris_credential kis_app_key kis_app_secret dart_api_key; do

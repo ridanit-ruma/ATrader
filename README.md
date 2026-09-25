@@ -81,6 +81,22 @@ tailscale serve --bg --https=443 http://127.0.0.1:8750
 Lost the authenticator? `atrader user reset-2fa <name>` turns the second factor off and signs every
 session out; the next sign-in enrols again.
 
+## Running with Docker
+
+`compose.yaml` runs ATrader with its own Postgres. Secrets are files under `./secrets`, never
+environment variables:
+
+```bash
+scripts/docker-init.sh                        # database password + empty optional key files
+docker compose up -d --build
+docker compose run --rm atrader user create <name>
+tailscale serve --bg --https=443 http://127.0.0.1:8750   # dashboard on your tailnet only
+```
+
+To connect to Attacca, write the `zc_` credential into `secrets/zyris_credential`, set
+`ATRADER_COMMAND=serve` in `.env`, and run `docker compose up -d`. KIS and DART keys go in
+`secrets/kis_app_key`, `secrets/kis_app_secret` and `secrets/dart_api_key` the same way.
+
 ## Deploying on NixOS
 
 The flake provides a package and a module. The module runs `atrader` as a hardened systemd service
