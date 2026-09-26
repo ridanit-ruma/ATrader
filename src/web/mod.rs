@@ -13,7 +13,7 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Extension, Json, Router};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use futures_util::{Stream, StreamExt, stream};
@@ -46,6 +46,8 @@ pub struct WebState {
     /// Where dashboard-entered keys are stored (`<dir>/settings/NAME`).
     pub settings_dir: std::path::PathBuf,
     pub enrollment: Arc<Mutex<EnrollView>>,
+    /// The live Attacca connection (set by the zyris link), for listing conversations.
+    pub attacca: crate::alerts::deliver::ConnSlot,
 }
 
 /// Where the dashboard's Attacca enrollment stands.
@@ -78,6 +80,7 @@ impl WebState {
             restart: Arc::default(),
             settings_dir: crate::settings::state_dir(),
             enrollment: Arc::default(),
+            attacca: Default::default(),
         }
     }
 
@@ -445,6 +448,45 @@ async fn reset_account(State(s): State<WebState>, peer: Peer, headers: HeaderMap
     Ok(Json(json!({"id": id, "generation": generation})))
 }
 
+/// The Attacca project whose conversations can receive alerts.
+const ALERT_PROJECT: &str = "ATrader";
+
+/// Conversations in the "ATrader" project (created when missing), newest first as Attacca lists them.
+async fn attacca_sessions(State(s): State<WebState>, headers: HeaderMap) -> ApiResult {
+    use zyris_attacca::{AttaccaApi, AttaccaApiClient, ZNewProject, ZSessionFilter};
+    authed(&s, &headers, false).await?;
+    let unavailable = |m: String| ApiError(StatusCode::SERVICE_UNAVAILABLE, "not_connected", m);
+    let upstream = |e: zyris::Error| ApiError(StatusCode::BAD_GATEWAY, "upstream", e.message);
+    let conn = s.attacca.get().ok_or_else(|| unavailable("not connected to Attacca".into()))?;
+    let api = conn.wait_capability::<AttaccaApiClient>(std::time::Duration::from_secs(5)).await.map_err(|e| unavailable(e.to_string()))?;
+    let project = match api.list_projects().await.map_err(upstream)?.into_iter().find(|p| p.name == ALERT_PROJECT) {
+        Some(p) => p,
+        None => api.create_project(ZNewProject { name: ALERT_PROJECT.into(), description: Some("ATrader alerts".into()) }).await.map_err(upstream)?,
+    };
+    let sessions = api.list_sessions(ZSessionFilter { project_id: Some(project.id.clone()), limit: Some(100) }).await.map_err(upstream)?;
+    Ok(Json(json!({
+        "project": {"id": project.id, "name": project.name},
+        "sessions": sessions.into_iter().map(|x| json!({"id": x.id, "title": x.title, "running": x.running})).collect::<Vec<_>>(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct AlertSessionBody {
+    session_id: Option<String>,
+}
+
+async fn set_alert_session(State(s): State<WebState>, peer: Peer, headers: HeaderMap, Path(id): Path<String>, Json(b): Json<AlertSessionBody>) -> ApiResult {
+    let (user, _) = authed(&s, &headers, false).await?;
+    row(&s, &id)?;
+    let session = b.session_id.as_deref().map(str::trim).filter(|x| !x.is_empty());
+    if session.is_some_and(|x| x.len() > 128 || x.chars().any(char::is_control)) {
+        return Err(bad_request("session id is too long or has control characters"));
+    }
+    s.app.store.set_alert_session(&id, session).await.map_err(internal)?;
+    let _ = s.auth.audit(Some(user.id), "alert_session", &format!("{id} -> {}", session.unwrap_or("-")), &peer_ip(&headers, peer)).await;
+    Ok(Json(json!({"id": id, "session_id": session})))
+}
+
 fn kst_midnight(now: DateTime<Utc>) -> DateTime<Utc> {
     let day = now.with_timezone(&chrono_tz::Asia::Seoul).date_naive();
     chrono_tz::Asia::Seoul.from_local_datetime(&day.and_hms_opt(0, 0, 0).expect("midnight")).single().map_or(now, |t| t.with_timezone(&Utc))
@@ -460,7 +502,8 @@ async fn overview(State(s): State<WebState>, headers: HeaderMap) -> ApiResult {
         let open = s.app.store.snapshots(&r.id, r.generation, Some(midnight), true).await.map_err(internal)?;
         let day_pnl = open.first().map(|o| summary.equity_krw - o.equity_krw);
         let total = t.get_performance(Some(r.id.clone()), "all".into()).await.ok().map(|p| p.return_pct);
-        out.push(json!({"id": r.id, "generation": r.generation, "summary": summary, "day_pnl_krw": day_pnl, "total_return_pct": total}));
+        let alert_session = s.app.store.alert_session(&r.id).await.map_err(internal)?;
+        out.push(json!({"id": r.id, "alert_session_id": alert_session, "generation": r.generation, "summary": summary, "day_pnl_krw": day_pnl, "total_return_pct": total}));
     }
     Ok(Json(Value::Array(out)))
 }
@@ -469,8 +512,10 @@ async fn account(State(s): State<WebState>, headers: HeaderMap, Path(id): Path<S
     authed(&s, &headers, false).await?;
     let r = row(&s, &id)?;
     let t = s.tools();
+    let alert_session = s.app.store.alert_session(&id).await.map_err(internal)?;
     Ok(Json(json!({
         "generation": r.generation,
+        "alert_session_id": alert_session,
         "summary": t.get_account(Some(id.clone())).await.map_err(tool_error)?,
         "positions": t.get_positions(Some(id.clone())).await.map_err(tool_error)?,
         "open_orders": t.list_orders(Some(id.clone()), Some(true), Some(200)).await.map_err(tool_error)?,
@@ -807,6 +852,8 @@ pub fn router(state: WebState) -> Router {
         .route("/api/accounts", post(create_account))
         .route("/api/accounts/{id}", get(account))
         .route("/api/accounts/{id}/reset", post(reset_account))
+        .route("/api/accounts/{id}/alert-session", put(set_alert_session))
+        .route("/api/attacca/sessions", get(attacca_sessions))
         .route("/api/accounts/{id}/equity", get(equity))
         .route("/api/accounts/{id}/fills", get(fills))
         .route("/api/accounts/{id}/orders", get(orders))

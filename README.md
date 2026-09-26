@@ -140,9 +140,11 @@ Then create the login and accounts with `atrader-manage`, which runs the CLI as 
 ## Alerts
 
 The agent can set alerts (price levels, % moves, volume surges, its own fills, market open and
-close). When one fires, ATrader posts the agent's own note back into the Attacca conversation that
-set the alert, so it can act without polling. The zyris credential needs the `sessions:read` and
-`sessions:write` scopes for this.
+close). When one fires, ATrader posts the agent's own note into the Attacca conversation chosen for
+that account on the dashboard's alerts page, from the conversations in the Attacca project
+"ATrader" (created on first use). Until one is chosen, alerts go back to the conversation that set
+them. The zyris credential needs the `projects:read`, `projects:write`, `sessions:read` and
+`sessions:write` scopes, which `zyris enroll` and the dashboard request.
 
 ## Stack
 

@@ -25,6 +25,7 @@ export interface AccountSummary {
 
 export interface OverviewRow {
   id: string;
+  alert_session_id: string | null;
   generation: number;
   summary: AccountSummary;
   day_pnl_krw: Dec | null;
@@ -198,4 +199,9 @@ export interface ZyrisStatus {
   enrolled: boolean;
   source: "env" | "file" | "dashboard" | null;
   enrollment: Enrollment;
+}
+
+export interface AttaccaSessions {
+  project: { id: string; name: string };
+  sessions: { id: string; title: string | null; running: boolean }[];
 }

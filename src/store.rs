@@ -513,7 +513,8 @@ impl Store {
         sqlx::query_scalar("SELECT alert_session_id FROM accounts WHERE id = $1").bind(account).fetch_one(&self.pool).await
     }
 
-    pub async fn set_alert_session(&self, account: &str, session: &str) -> sqlx::Result<()> {
+    /// The Attacca session alerts on `account` go to; `None` clears it.
+    pub async fn set_alert_session(&self, account: &str, session: Option<&str>) -> sqlx::Result<()> {
         sqlx::query("UPDATE accounts SET alert_session_id = $2 WHERE id = $1").bind(account).bind(session).execute(&self.pool).await?;
         Ok(())
     }

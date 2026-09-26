@@ -254,7 +254,7 @@ impl atrader::alerts::deliver::Notifier for Recorder {
 async fn fired_alerts_reach_the_conversation_once(pool: PgPool) {
     use atrader::alerts::{Alert, Condition, deliver::{AlertCmd, alert_loop}};
     let (app, _t) = rig(pool).await;
-    app.store.set_alert_session("bot", "sess-1").await.unwrap();
+    app.store.set_alert_session("bot", Some("sess-1")).await.unwrap();
     let (bus, _) = broadcast::channel(64);
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let rec = Arc::new(Recorder { sent: Default::default(), fail: Default::default() });
@@ -294,7 +294,7 @@ async fn fired_alerts_reach_the_conversation_once(pool: PgPool) {
 async fn failed_deliveries_are_recorded(pool: PgPool) {
     use atrader::alerts::{Alert, Condition, deliver::{AlertCmd, alert_loop}};
     let (app, _t) = rig(pool.clone()).await;
-    app.store.set_alert_session("bot", "sess-1").await.unwrap();
+    app.store.set_alert_session("bot", Some("sess-1")).await.unwrap();
     let (bus, _) = broadcast::channel(64);
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let rec = Arc::new(Recorder { sent: Default::default(), fail: std::sync::atomic::AtomicBool::new(true) });
@@ -496,14 +496,18 @@ async fn create_alert_remembers_the_calling_conversation(pool: PgPool) {
     use zyris::ServeCapability;
     let (app, _t) = rig(pool).await;
     let server = atrader::tools::Portable(TraderServer(TraderTools::new(app.clone())));
-    let call = zyris::IncomingCall {
+    let call = || zyris::IncomingCall {
         tool: "create_alert".into(),
         params: zyris::Payload::from_json(serde_json::json!({"account": "bot", "alert": {"kind": "price_above", "instrument": "UPBIT:KRW-BTC", "threshold": 100000000, "note": "breakout"}})),
         serialization: zyris::Serialization::Msgpack,
         meta: zyris::Payload::from_json(serde_json::json!({"session_id": "s-9"})),
     };
-    server.dispatch(call).await.unwrap();
+    server.dispatch(call()).await.unwrap();
     assert_eq!(app.store.alert_session("bot").await.unwrap().as_deref(), Some("s-9"));
+    // A conversation chosen on the dashboard is not overridden by the next caller.
+    app.store.set_alert_session("bot", Some("chosen")).await.unwrap();
+    server.dispatch(call()).await.unwrap();
+    assert_eq!(app.store.alert_session("bot").await.unwrap().as_deref(), Some("chosen"));
 }
 
 /// zyris sends schemas and results as msgpack. Nothing may reach it as serde_json's private

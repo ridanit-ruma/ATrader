@@ -238,3 +238,24 @@ async fn new_accounts_need_only_a_name(pool: PgPool) {
     let agents = r.clone().oneshot(req("GET", "/api/agents", Some(&c), None)).await.unwrap();
     assert_eq!(agents.status(), StatusCode::NOT_FOUND, "agent ids are gone");
 }
+
+#[sqlx::test]
+async fn alerts_go_to_a_chosen_conversation(pool: PgPool) {
+    let (r, _, secret) = web(pool).await;
+    let c = login(&r, &secret).await;
+    // Not connected to Attacca in tests: the session list says so plainly.
+    let list = r.clone().oneshot(req("GET", "/api/attacca/sessions", Some(&c), None)).await.unwrap();
+    assert_eq!(list.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let put = |body: serde_json::Value| req("PUT", "/api/accounts/bot/alert-session", Some(&c), Some(body));
+    assert_eq!(r.clone().oneshot(put(serde_json::json!({"session_id": "s-7"}))).await.unwrap().status(), StatusCode::OK);
+    let detail = r.clone().oneshot(req("GET", "/api/accounts/bot", Some(&c), None)).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(detail.into_body(), 100_000).await.unwrap()).unwrap();
+    assert_eq!(v["alert_session_id"], "s-7");
+    assert_eq!(r.clone().oneshot(put(serde_json::json!({"session_id": null}))).await.unwrap().status(), StatusCode::OK);
+    let detail = r.clone().oneshot(req("GET", "/api/accounts/bot", Some(&c), None)).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(detail.into_body(), 100_000).await.unwrap()).unwrap();
+    assert_eq!(v["alert_session_id"], serde_json::Value::Null);
+    let missing = req("PUT", "/api/accounts/nope/alert-session", Some(&c), Some(serde_json::json!({"session_id": "s"})));
+    assert_eq!(r.clone().oneshot(missing).await.unwrap().status(), StatusCode::NOT_FOUND);
+}

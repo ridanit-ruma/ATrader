@@ -688,9 +688,11 @@ impl Trader for TraderTools {
             last_fired_at: None,
         };
         a.id = self.app.store.create_alert(&a).await.map_err(upstream)?;
-        // Alerts on this account now go back to the conversation that set this one.
+        // With no conversation chosen yet, alerts go back to the one that set this alert.
         if let Some(session) = caller_session() {
-            self.app.store.set_alert_session(&row.id, &session).await.map_err(upstream)?;
+            if self.app.store.alert_session(&row.id).await.map_err(upstream)?.is_none() {
+                self.app.store.set_alert_session(&row.id, Some(&session)).await.map_err(upstream)?;
+            }
         }
         if let Some(tx) = &self.app.alerts {
             let _ = tx.send(crate::alerts::deliver::AlertCmd::Upsert(a.clone()));

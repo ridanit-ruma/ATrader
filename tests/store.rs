@@ -291,6 +291,6 @@ async fn alerts_round_trip_per_account_and_generation(pool: PgPool) {
     let ev = store.record_alert_event(id, "a", Utc::now(), "fired", false, Some("offline")).await.unwrap();
     store.set_event_delivered(ev, true, None).await.unwrap();
     assert_eq!(store.alert_session("a").await.unwrap(), None);
-    store.set_alert_session("a", "sess-1").await.unwrap();
+    store.set_alert_session("a", Some("sess-1")).await.unwrap();
     assert_eq!(store.alert_session("a").await.unwrap().as_deref(), Some("sess-1"));
 }

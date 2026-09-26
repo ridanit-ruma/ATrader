@@ -236,6 +236,8 @@ async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
 
     let addr: std::net::SocketAddr = std::env::var("ATRADER_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:8750".into()).parse().context("ATRADER_HTTP_ADDR")?;
     let web = crate::web::WebState::new(app.clone(), crate::web::auth::AuthStore(app.store.pool().clone()), true).with_bus(bus.clone());
+    let mut web = web;
+    web.attacca = slot.clone();
     let zyris_connected = web.zyris_connected.clone();
     let restart = web.restart.clone();
     tokio::spawn(async move {
@@ -328,9 +330,9 @@ async fn finish(broker: &SimBroker, writer: tokio::task::JoinHandle<()>, restart
     Ok(())
 }
 
-/// Scopes the credential is issued with; they never widen later. Alerts post to the conversation
-/// that set them.
-const ENROLL_SCOPES: [&str; 2] = ["sessions:read", "sessions:write"];
+/// Scopes the credential is issued with; they never widen later. Alerts post to a conversation in
+/// the Attacca project "ATrader", which the dashboard lists (and creates when missing).
+const ENROLL_SCOPES: [&str; 4] = ["projects:read", "projects:write", "sessions:read", "sessions:write"];
 
 pub fn zyris_server() -> String {
     std::env::var("ZYRIS_SERVER_URL").unwrap_or_else(|_| zyris::DEFAULT_SERVER_URL.to_string())
