@@ -34,6 +34,7 @@ services:
     command: ${ATRADER_COMMAND:-serve}
     environment:
       ATRADER_HTTP_ADDR: 127.0.0.1:${ATRADER_HTTP_PORT:-8750}
+      ATRADER_COOKIE_SECURE: ${ATRADER_COOKIE_SECURE:-true}
       DATABASE_URL_FILE: /run/secrets/database_url
       ZYRIS_CREDENTIAL_FILE: /run/secrets/zyris_credential
       KIS_APP_KEY_FILE: /run/secrets/kis_app_key
