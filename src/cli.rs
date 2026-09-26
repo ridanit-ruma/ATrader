@@ -43,7 +43,7 @@ ENVIRONMENT:
   ATRADER_STATE_DIR     where the KIS token is cached (default: ~/.local/state/atrader)
   DART_API_KEY          OpenDART key (KRX financials and filings)
   EDGAR_USER_AGENT      name and contact email for SEC EDGAR (US financials and filings)
-  ATRADER_HTTP_ADDR     dashboard listen address (default: 127.0.0.1:8750)
+  ATRADER_HTTP_ADDR     dashboard listen addresses, comma-separated (default: 127.0.0.1:8750)
   ATRADER_COOKIE_SECURE `false` to allow login over plain HTTP (only inside a tailnet)
   RUST_LOG              log filter (default: atrader=info,zyris_core=info)";
 
@@ -238,17 +238,24 @@ async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
     // Off only when the dashboard is reached over plain HTTP inside an encrypted tailnet (a
     // browser drops `Secure` cookies from http:// on anything but localhost).
     let cookie_secure = !std::env::var("ATRADER_COOKIE_SECURE").is_ok_and(|v| v.eq_ignore_ascii_case("false"));
-    let addr: std::net::SocketAddr = std::env::var("ATRADER_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:8750".into()).parse().context("ATRADER_HTTP_ADDR")?;
+    let addrs: Vec<std::net::SocketAddr> = std::env::var("ATRADER_HTTP_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:8750".into())
+        .split(',')
+        .map(|a| a.trim().parse().with_context(|| format!("ATRADER_HTTP_ADDR: {a:?}")))
+        .collect::<anyhow::Result<_>>()?;
     let web = crate::web::WebState::new(app.clone(), crate::web::auth::AuthStore(app.store.pool().clone()), cookie_secure).with_bus(bus.clone());
     let mut web = web;
     web.attacca = slot.clone();
     let zyris_connected = web.zyris_connected.clone();
     let restart = web.restart.clone();
-    tokio::spawn(async move {
-        if let Err(e) = crate::web::serve_http(web, addr).await {
-            tracing::error!(error = %e, "dashboard stopped");
-        }
-    });
+    for addr in addrs {
+        let web = web.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::web::serve_http(web, addr).await {
+                tracing::error!(error = %e, %addr, "dashboard stopped");
+            }
+        });
+    }
 
     let timers = app.clone();
     tokio::spawn(async move {

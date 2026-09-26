@@ -33,7 +33,8 @@ services:
       postgres: { condition: service_healthy }
     command: ${ATRADER_COMMAND:-serve}
     environment:
-      ATRADER_HTTP_ADDR: 127.0.0.1:${ATRADER_HTTP_PORT:-8750}
+      # Add the machine's tailnet address (`127.0.0.1:8750,100.x.y.z:8750`) to open it by IP.
+      ATRADER_HTTP_ADDR: ${ATRADER_HTTP_ADDR:-127.0.0.1:8750}
       ATRADER_COOKIE_SECURE: ${ATRADER_COOKIE_SECURE:-true}
       DATABASE_URL_FILE: /run/secrets/database_url
       ZYRIS_CREDENTIAL_FILE: /run/secrets/zyris_credential

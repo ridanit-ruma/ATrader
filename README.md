@@ -81,8 +81,9 @@ tailscale serve --bg --https=443 http://127.0.0.1:8750
 ```
 
 To open it by the machine's tailnet IP over plain HTTP instead (tailnet traffic is already
-encrypted by WireGuard), also run `tailscale serve --bg --http=80 http://127.0.0.1:8750` and set
-`ATRADER_COOKIE_SECURE=false`, since browsers drop `Secure` cookies on `http://` addresses.
+encrypted by WireGuard), listen there too with `ATRADER_HTTP_ADDR=127.0.0.1:8750,<tailnet-ip>:8750`
+and set `ATRADER_COOKIE_SECURE=false`, since browsers drop `Secure` cookies on `http://` addresses.
+Keep the firewall closed to other networks: only the tailnet address should reach that port.
 
 Lost the authenticator? `atrader user reset-2fa <name>` turns the second factor off and signs every
 session out; the next sign-in enrols again.

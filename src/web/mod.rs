@@ -871,7 +871,17 @@ pub fn router(state: WebState) -> Router {
 }
 
 pub async fn serve_http(state: WebState, addr: SocketAddr) -> anyhow::Result<()> {
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    // A tailnet address exists only once tailscaled is up, which may be after we start.
+    let listener = loop {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(l) => break l,
+            Err(e) if e.kind() == std::io::ErrorKind::AddrNotAvailable => {
+                tracing::warn!(%addr, "address not up yet; retrying in 5 s");
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
     tracing::info!(%addr, "dashboard listening");
     axum::serve(listener, router(state).into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
