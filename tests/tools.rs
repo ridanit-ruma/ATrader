@@ -28,7 +28,7 @@ fn code(e: &zyris::Error) -> String {
 
 fn buy(account: &str, qty: Option<Decimal>, reason: &str) -> OrderInput {
     OrderInput {
-        account: account.into(),
+        account: Some(account.into()),
         instrument: "UPBIT:KRW-BTC".into(),
         side: SideDto::Buy,
         kind: KindDto::Market,
@@ -79,7 +79,6 @@ async fn order_errors_keep_their_code_and_fields(pool: PgPool) {
     assert_eq!(code(&e), "INSUFFICIENT_FUNDS");
     let data = serde_json::to_value(e.data.unwrap()).unwrap();
     assert!(data.get("available").is_some(), "data {data}");
-    assert_eq!(code(&t.place_order(buy("manual", Some(dec!(0.1)), "not mine")).await.unwrap_err()), "UNKNOWN_ACCOUNT");
     assert_eq!(code(&t.place_order(buy("nobody", Some(dec!(0.1)), "why")).await.unwrap_err()), "UNKNOWN_ACCOUNT");
 }
 
@@ -112,7 +111,7 @@ fn every_order_error_maps_to_a_code() {
 #[sqlx::test]
 async fn place_then_read_history_and_account(pool: PgPool) {
     let (app, t) = rig(pool).await;
-    assert_eq!(t.list_accounts().await.unwrap().iter().map(|a| a.id.clone()).collect::<Vec<_>>(), vec!["bot"]);
+    assert_eq!(t.list_accounts().await.unwrap().iter().map(|a| a.id.clone()).collect::<Vec<_>>(), vec!["bot", "manual"]);
     let est = t.estimate_order(buy("bot", Some(dec!(0.1)), "sizing")).await.unwrap();
     assert_eq!(est.filled_qty, dec!(0.1));
     let placed = t.place_order(buy("bot", Some(dec!(0.1)), "momentum entry")).await.unwrap();
@@ -121,27 +120,27 @@ async fn place_then_read_history_and_account(pool: PgPool) {
 
     let mut fills = Vec::new();
     for _ in 0..100 {
-        fills = t.list_fills("bot".into(), None, None).await.unwrap();
+        fills = t.list_fills(Some("bot".into()), None, None).await.unwrap();
         if !fills.is_empty() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(fills.len(), 1);
-    let orders = t.list_orders("bot".into(), None, None).await.unwrap();
+    let orders = t.list_orders(Some("bot".into()), None, None).await.unwrap();
     assert_eq!(orders[0].reason, "momentum entry");
 
-    let acct = t.get_account("bot".into()).await.unwrap();
+    let acct = t.get_account(Some("bot".into())).await.unwrap();
     assert!(acct.equity_krw < dec!(1000000000) && acct.equity_krw > dec!(999900000), "equity {}", acct.equity_krw);
-    let pos = t.get_positions("bot".into()).await.unwrap();
+    let pos = t.get_positions(Some("bot".into())).await.unwrap();
     assert_eq!(pos[0].qty, dec!(0.1));
     assert!(pos[0].weight_pct > dec!(0) && pos[0].weight_pct < dec!(2));
 
-    let c = t.convert_currency("bot".into(), "krw".into(), "USD".into(), dec!(1400000)).await.unwrap();
+    let c = t.convert_currency(Some("bot".into()), "krw".into(), "USD".into(), dec!(1400000)).await.unwrap();
     assert_eq!(c.credit, dec!(999));
-    let acct = t.get_account("bot".into()).await.unwrap();
+    let acct = t.get_account(Some("bot".into())).await.unwrap();
     assert!(acct.cash.iter().any(|c| c.currency == "USD" && c.balance == dec!(999)));
-    assert_eq!(code(&t.convert_currency("bot".into(), "KRW".into(), "EUR".into(), dec!(1)).await.unwrap_err()), "InvalidParams");
+    assert_eq!(code(&t.convert_currency(Some("bot".into()), "KRW".into(), "EUR".into(), dec!(1)).await.unwrap_err()), "InvalidParams");
     let _ = app;
 }
 
@@ -153,12 +152,12 @@ async fn resting_orders_can_be_listed_and_cancelled(pool: PgPool) {
     o.limit_price = Some(dec!(99000000));
     let placed = t.place_order(o).await.unwrap();
     assert_eq!((placed.order.status.as_str(), placed.order.tif), ("open", TifDto::Gtc));
-    let cancelled = t.cancel_order("bot".into(), placed.order.id).await.unwrap();
+    let cancelled = t.cancel_order(Some("bot".into()), placed.order.id).await.unwrap();
     assert_eq!(cancelled.status, "cancelled");
-    assert_eq!(code(&t.cancel_order("bot".into(), 999).await.unwrap_err()), "NOT_FOUND");
-    assert_eq!(code(&t.cancel_order("manual".into(), placed.order.id).await.unwrap_err()), "UNKNOWN_ACCOUNT");
-    assert_eq!(code(&t.get_account("manual".into()).await.unwrap_err()), "UNKNOWN_ACCOUNT");
-    assert_eq!(code(&t.list_orders("manual".into(), None, None).await.unwrap_err()), "UNKNOWN_ACCOUNT");
+    assert_eq!(code(&t.cancel_order(Some("bot".into()), 999).await.unwrap_err()), "NOT_FOUND");
+    assert_eq!(code(&t.cancel_order(Some("manual".into()), placed.order.id).await.unwrap_err()), "NOT_FOUND", "another account's order");
+    assert_eq!(code(&t.get_account(Some("nobody".into())).await.unwrap_err()), "UNKNOWN_ACCOUNT");
+    assert_eq!(code(&t.list_orders(Some("nobody".into()), None, None).await.unwrap_err()), "UNKNOWN_ACCOUNT");
 }
 
 #[sqlx::test]
@@ -169,7 +168,7 @@ async fn restart_restores_cash_positions_and_open_orders(pool: PgPool) {
     o.kind = KindDto::Limit;
     o.limit_price = Some(dec!(99000000));
     let resting = t.place_order(o).await.unwrap().order;
-    t.convert_currency("bot".into(), "KRW".into(), "USD".into(), dec!(1400000)).await.unwrap();
+    t.convert_currency(Some("bot".into()), "KRW".into(), "USD".into(), dec!(1400000)).await.unwrap();
     for _ in 0..100 {
         if app.store.orders("bot", 1, true, 10).await.unwrap().len() == 1 && app.store.cash_balances("bot", 1).await.unwrap().contains_key(&Currency::Usd) {
             break;
@@ -219,9 +218,9 @@ async fn research_tools(pool: PgPool) {
     assert_eq!(code(&t.screen("KRX".into(), "gainers".into(), None).await.unwrap_err()), "INVALID_REQUEST"); // no KRX feed here
 
     t.place_order(buy("bot", Some(dec!(0.1)), "entry")).await.unwrap();
-    let p = t.get_performance("bot".into(), "all".into()).await.unwrap();
+    let p = t.get_performance(Some("bot".into()), "all".into()).await.unwrap();
     assert!(p.trades <= 1); // the journal may not have landed yet; no panic either way
-    assert_eq!(code(&t.get_performance("bot".into(), "1y".into()).await.unwrap_err()), "InvalidParams");
+    assert_eq!(code(&t.get_performance(Some("bot".into()), "1y".into()).await.unwrap_err()), "InvalidParams");
     let _ = app;
 }
 
@@ -236,25 +235,26 @@ async fn fundamentals_need_their_keys(pool: PgPool) {
 }
 
 struct Recorder {
-    sent: std::sync::Mutex<Vec<(String, String, Option<String>, String)>>,
+    sent: std::sync::Mutex<Vec<(String, String)>>,
     fail: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait]
 impl atrader::alerts::deliver::Notifier for Recorder {
-    async fn send(&self, agent_id: &str, account: &str, session: Option<String>, text: &str) -> anyhow::Result<String> {
+    async fn send(&self, session: &str, text: &str) -> anyhow::Result<()> {
         if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
             anyhow::bail!("attacca unreachable");
         }
-        self.sent.lock().unwrap().push((agent_id.into(), account.into(), session, text.into()));
-        Ok("sess-1".into())
+        self.sent.lock().unwrap().push((session.into(), text.into()));
+        Ok(())
     }
 }
 
 #[sqlx::test]
-async fn fired_alerts_reach_the_agent_once(pool: PgPool) {
+async fn fired_alerts_reach_the_conversation_once(pool: PgPool) {
     use atrader::alerts::{Alert, Condition, deliver::{AlertCmd, alert_loop}};
     let (app, _t) = rig(pool).await;
+    app.store.set_alert_session("bot", "sess-1").await.unwrap();
     let (bus, _) = broadcast::channel(64);
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let rec = Arc::new(Recorder { sent: Default::default(), fail: Default::default() });
@@ -284,17 +284,17 @@ async fn fired_alerts_reach_the_agent_once(pool: PgPool) {
     tokio::time::sleep(Duration::from_millis(100)).await;
     let sent = rec.sent.lock().unwrap().clone();
     assert_eq!(sent.len(), 1, "{sent:?}");
-    let (agent, account, session, text) = &sent[0];
-    assert_eq!((agent.as_str(), account.as_str(), session.as_deref()), ("agent-1", "bot", None));
+    let (session, text) = &sent[0];
+    assert_eq!(session, "sess-1");
     assert!(text.contains("breakout") && text.contains("#") && text.contains("equity"), "{text}");
     assert!(app.store.active_alerts("bot", 1).await.unwrap().is_empty()); // one-shot persisted as off
-    assert_eq!(app.store.alert_session("bot").await.unwrap().as_deref(), Some("sess-1"));
 }
 
 #[sqlx::test]
 async fn failed_deliveries_are_recorded(pool: PgPool) {
     use atrader::alerts::{Alert, Condition, deliver::{AlertCmd, alert_loop}};
     let (app, _t) = rig(pool.clone()).await;
+    app.store.set_alert_session("bot", "sess-1").await.unwrap();
     let (bus, _) = broadcast::channel(64);
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let rec = Arc::new(Recorder { sent: Default::default(), fail: std::sync::atomic::AtomicBool::new(true) });
@@ -320,7 +320,8 @@ async fn failed_deliveries_are_recorded(pool: PgPool) {
     bus.send(atrader::market::BusEvent::Fill(fill)).unwrap();
     let mut row = None;
     for _ in 0..100 {
-        row = sqlx::query_as::<_, (bool, Option<String>)>("SELECT delivered, error FROM alert_events").fetch_optional(&pool).await.unwrap();
+        // The row is written first and its error a moment later.
+        row = sqlx::query_as::<_, (bool, Option<String>)>("SELECT delivered, error FROM alert_events WHERE error IS NOT NULL").fetch_optional(&pool).await.unwrap();
         if row.is_some() {
             break;
         }
@@ -338,70 +339,71 @@ fn alert_input(kind: &str) -> AlertInput {
 #[sqlx::test]
 async fn alert_tools_validate_and_scope_to_the_account(pool: PgPool) {
     let (_, t) = rig(pool).await;
-    let a = t.create_alert("bot".into(), alert_input("price_above")).await.unwrap();
+    let a = t.create_alert(Some("bot".into()), alert_input("price_above")).await.unwrap();
     assert!(a.once && a.id > 0);
-    assert_eq!(t.list_alerts("bot".into()).await.unwrap().len(), 1);
+    assert_eq!(t.list_alerts(Some("bot".into())).await.unwrap().len(), 1);
 
     let mut m = alert_input("move");
-    assert_eq!(code(&t.create_alert("bot".into(), m.clone()).await.unwrap_err()), "InvalidParams"); // no window
+    assert_eq!(code(&t.create_alert(Some("bot".into()), m.clone()).await.unwrap_err()), "InvalidParams"); // no window
     m.window_minutes = Some(0);
-    assert_eq!(code(&t.create_alert("bot".into(), m.clone()).await.unwrap_err()), "InvalidParams");
+    assert_eq!(code(&t.create_alert(Some("bot".into()), m.clone()).await.unwrap_err()), "InvalidParams");
     m.window_minutes = Some(30);
     m.threshold = Some(dec!(3));
-    t.create_alert("bot".into(), m).await.unwrap();
+    t.create_alert(Some("bot".into()), m).await.unwrap();
 
     let mut no_threshold = alert_input("price_below");
     no_threshold.threshold = None;
-    assert_eq!(code(&t.create_alert("bot".into(), no_threshold).await.unwrap_err()), "InvalidParams");
+    assert_eq!(code(&t.create_alert(Some("bot".into()), no_threshold).await.unwrap_err()), "InvalidParams");
     let mut unknown = alert_input("price_above");
     unknown.instrument = Some("UPBIT:KRW-NOPE".into());
-    assert_eq!(code(&t.create_alert("bot".into(), unknown).await.unwrap_err()), "UNKNOWN_INSTRUMENT");
+    assert_eq!(code(&t.create_alert(Some("bot".into()), unknown).await.unwrap_err()), "UNKNOWN_INSTRUMENT");
     let session = AlertInput { kind: "session_open".into(), instrument: None, venue: Some("NASDAQ".into()), threshold: None, window_minutes: None, note: "x".into(), once: None };
-    assert_eq!(code(&t.create_alert("bot".into(), session).await.unwrap_err()), "InvalidParams");
-    assert_eq!(code(&t.create_alert("bot".into(), alert_input("teleport")).await.unwrap_err()), "InvalidParams");
-    assert_eq!(code(&t.create_alert("manual".into(), alert_input("price_above")).await.unwrap_err()), "UNKNOWN_ACCOUNT");
+    assert_eq!(code(&t.create_alert(Some("bot".into()), session).await.unwrap_err()), "InvalidParams");
+    assert_eq!(code(&t.create_alert(Some("bot".into()), alert_input("teleport")).await.unwrap_err()), "InvalidParams");
+    assert_eq!(code(&t.create_alert(Some("nobody".into()), alert_input("price_above")).await.unwrap_err()), "UNKNOWN_ACCOUNT");
 
-    assert_eq!(code(&t.delete_alert("bot".into(), 999_999).await.unwrap_err()), "NOT_FOUND");
-    let gone = t.delete_alert("bot".into(), a.id).await.unwrap();
+    assert_eq!(code(&t.delete_alert(Some("bot".into()), 999_999).await.unwrap_err()), "NOT_FOUND");
+    let gone = t.delete_alert(Some("bot".into()), a.id).await.unwrap();
     assert!(!gone.active);
-    assert_eq!(t.list_alerts("bot".into()).await.unwrap().len(), 1);
+    assert_eq!(t.list_alerts(Some("bot".into())).await.unwrap().len(), 1);
 }
 
 #[sqlx::test]
-async fn simultaneous_alerts_share_one_new_session(pool: PgPool) {
+async fn alerts_with_no_conversation_are_recorded_as_undelivered(pool: PgPool) {
     use atrader::alerts::{Alert, Condition, deliver::{AlertCmd, alert_loop}};
-    let (app, _t) = rig(pool).await;
+    let (app, _t) = rig(pool.clone()).await;
     let (bus, _) = broadcast::channel(64);
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let rec = Arc::new(Recorder { sent: Default::default(), fail: Default::default() });
     tokio::spawn(alert_loop(app.clone(), bus.subscribe(), cmd_rx, rec.clone()));
-    for price in [dec!(99000000), dec!(99500000)] {
-        let a = Alert { id: 0, account: "bot".into(), generation: 1, condition: Condition::PriceAbove { id: "UPBIT:KRW-BTC".parse().unwrap(), price }, note: "n".into(), once: true, created_at: Utc::now(), last_fired_at: None };
-        let id = app.store.create_alert(&a).await.unwrap();
-        cmd_tx.send(AlertCmd::Upsert(Alert { id, ..a })).unwrap();
-    }
+    let a = Alert { id: 0, account: "bot".into(), generation: 1, condition: Condition::PriceAbove { id: "UPBIT:KRW-BTC".parse().unwrap(), price: dec!(99000000) }, note: "n".into(), once: true, created_at: Utc::now(), last_fired_at: None };
+    let id = app.store.create_alert(&a).await.unwrap();
+    cmd_tx.send(AlertCmd::Upsert(Alert { id, ..a })).unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     bus.send(atrader::market::BusEvent::Market(MarketEvent::Trade(Trade { instrument: "UPBIT:KRW-BTC".parse().unwrap(), price: dec!(100000000), qty: dec!(1), at: Utc::now() }))).unwrap();
+    let mut row = None;
     for _ in 0..100 {
-        if rec.sent.lock().unwrap().len() == 2 {
+        // The row is written first and its error a moment later.
+        row = sqlx::query_as::<_, (bool, Option<String>)>("SELECT delivered, error FROM alert_events WHERE error IS NOT NULL").fetch_optional(&pool).await.unwrap();
+        if row.is_some() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let sent = rec.sent.lock().unwrap().clone();
-    assert_eq!(sent.len(), 2);
-    assert_eq!(sent.iter().filter(|s| s.2.is_none()).count(), 1, "both deliveries created a session: {sent:?}");
+    let (delivered, error) = row.expect("an event row");
+    assert!(!delivered && error.unwrap().contains("conversation"));
+    assert!(rec.sent.lock().unwrap().is_empty());
 }
 
 #[sqlx::test]
 async fn accounts_are_created_and_reset_live(pool: PgPool) {
     let (app, t) = rig(pool).await;
-    app.create_account("fresh", "Fresh", Some("agent-2"), &[(Currency::Krw, dec!(1000000))]).await.unwrap();
+    app.create_account("fresh", "Fresh", &[(Currency::Krw, dec!(1000000))]).await.unwrap();
     assert!(t.list_accounts().await.unwrap().iter().any(|a| a.id == "fresh"));
     t.place_order(buy("fresh", Some(dec!(0.001)), "first")).await.unwrap();
     let generation = app.reset_account("fresh", &[(Currency::Krw, dec!(2000000))]).await.unwrap();
     assert_eq!(generation, 2);
-    let acct = t.get_account("fresh".into()).await.unwrap();
+    let acct = t.get_account(Some("fresh".into())).await.unwrap();
     assert_eq!(acct.equity_krw, dec!(2000000));
     t.place_order(buy("fresh", Some(dec!(0.001)), "second")).await.unwrap();
     for _ in 0..100 {
@@ -470,14 +472,38 @@ fn announced_schemas_are_portable() {
 }
 
 #[sqlx::test]
-async fn giving_an_account_to_an_agent_shows_it_and_forgets_the_alert_session(pool: PgPool) {
-    let (app, t) = rig(pool).await;
-    assert!(!t.list_accounts().await.unwrap().iter().any(|a| a.id == "manual"));
-    app.store.set_alert_session("manual", "old-session").await.unwrap();
-    app.set_account_agent("manual", Some("agent-2")).await.unwrap();
-    assert!(t.list_accounts().await.unwrap().iter().any(|a| a.id == "manual"));
-    assert_eq!(app.store.alert_session("manual").await.unwrap(), None, "the old agent's session is not reused");
-    assert!(app.set_account_agent("nope", None).await.is_err());
+async fn every_account_is_visible_and_the_only_one_needs_no_name(pool: PgPool) {
+    let (_, t) = rig(pool).await;
+    let ids: Vec<String> = t.list_accounts().await.unwrap().into_iter().map(|a| a.id).collect();
+    assert_eq!(ids, vec!["bot", "manual"]);
+    let e = t.get_account(None).await.unwrap_err();
+    assert!(e.message.contains("bot (Bot)") && e.message.contains("manual (Manual)"), "{}", e.message);
+    assert_eq!(t.get_account(Some("manual".into())).await.unwrap().id, "manual");
+
+}
+
+#[sqlx::test]
+async fn the_only_account_needs_no_name(pool: PgPool) {
+    let (_, t) = rig_with(pool, &["bot"]).await;
+    assert_eq!(t.get_account(None).await.unwrap().id, "bot");
+    let mut order = buy("bot", Some(dec!(0.001)), "no account named");
+    order.account = None;
+    t.place_order(order).await.unwrap();
+}
+
+#[sqlx::test]
+async fn create_alert_remembers_the_calling_conversation(pool: PgPool) {
+    use zyris::ServeCapability;
+    let (app, _t) = rig(pool).await;
+    let server = atrader::tools::Portable(TraderServer(TraderTools::new(app.clone())));
+    let call = zyris::IncomingCall {
+        tool: "create_alert".into(),
+        params: zyris::Payload::from_json(serde_json::json!({"account": "bot", "alert": {"kind": "price_above", "instrument": "UPBIT:KRW-BTC", "threshold": 100000000, "note": "breakout"}})),
+        serialization: zyris::Serialization::Msgpack,
+        meta: zyris::Payload::from_json(serde_json::json!({"session_id": "s-9"})),
+    };
+    server.dispatch(call).await.unwrap();
+    assert_eq!(app.store.alert_session("bot").await.unwrap().as_deref(), Some("s-9"));
 }
 
 /// zyris sends schemas and results as msgpack. Nothing may reach it as serde_json's private

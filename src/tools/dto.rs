@@ -91,8 +91,9 @@ impl From<Tif> for TifDto {
 /// An order to estimate or place.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct OrderInput {
-    /// Account id from `list_accounts`.
-    pub account: String,
+    /// Account id from `list_accounts`; may be left out while there is only one account.
+    #[serde(default)]
+    pub account: Option<String>,
     /// Instrument id `VENUE:SYMBOL`, e.g. `UPBIT:KRW-BTC`, `BINANCE:BTCUSDT`, `KRX:005930`, `US:AAPL`.
     pub instrument: String,
     pub side: SideDto,

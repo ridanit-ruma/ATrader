@@ -43,8 +43,7 @@ export const api = {
   revoke: (id: string) => call("DELETE", `/api/auth/sessions/${enc(id)}`),
   audit: () => get<T.AuditRow[]>("/api/audit"),
   overview: () => get<T.OverviewRow[]>("/api/overview"),
-  createAccount: (id: string, name: string, agent_id: string, cash: Cash) =>
-    post("/api/accounts", { id, name, agent_id: agent_id || undefined, cash }),
+  createAccount: (name: string, cash: Cash) => post<{ id: string }>("/api/accounts", { name, cash }),
   resetAccount: (id: string, cash: Cash) => post(`/api/accounts/${enc(id)}/reset`, { cash }),
   account: (id: string) => get<T.AccountDetail>(`/api/accounts/${enc(id)}`),
   equity: (id: string, range: string) => get<T.EquityPoint[]>(`/api/accounts/${enc(id)}/equity?range=${range}`),
@@ -55,8 +54,6 @@ export const api = {
   chart: (id: string, interval: string, account?: string) =>
     get<T.Chart>(`/api/instruments/${enc(id)}/chart?interval=${interval}&limit=300${account ? `&account=${enc(account)}` : ""}`),
   health: () => get<T.Health>("/api/health"),
-  agents: () => get<T.Agent[]>("/api/agents"),
-  setAgent: (id: string, agent_id: string | null) => call("PUT", `/api/accounts/${enc(id)}/agent`, { agent_id }),
   keys: () => get<T.KeySetting[]>("/api/settings/keys"),
   saveKeys: (values: Record<string, string>) => call<{ restarting: boolean }>("PUT", "/api/settings/keys", values),
   zyris: () => get<T.ZyrisStatus>("/api/zyris"),

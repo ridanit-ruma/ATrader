@@ -6,8 +6,18 @@
 use serde_json::{Map, Value};
 use zyris::{CapabilityDescriptor, IncomingCall, Outgoing, ServeCapability};
 
-/// Serves `S` unchanged but announces its tools with portable schemas.
+/// Serves `S` but announces its tools with portable schemas, and makes the calling Attacca
+/// session (the `session_id` in the call's `meta`) visible to the tool through [`caller_session`].
 pub struct Portable<S>(pub S);
+
+tokio::task_local! {
+    static CALLER_SESSION: Option<String>;
+}
+
+/// The Attacca session whose agent made the current tool call, if the caller said.
+pub fn caller_session() -> Option<String> {
+    CALLER_SESSION.try_with(Clone::clone).ok().flatten()
+}
 
 #[zyris::async_trait]
 impl<S: ServeCapability> ServeCapability for Portable<S> {
@@ -16,7 +26,13 @@ impl<S: ServeCapability> ServeCapability for Portable<S> {
     }
 
     async fn dispatch(&self, call: IncomingCall) -> zyris::Result<Outgoing> {
-        self.0.dispatch(call).await
+        let meta = call.meta.to_json().unwrap_or(Value::Null);
+        let session = meta.get("session_id").and_then(Value::as_str).map(str::to_string);
+        if session.is_none() && !meta.is_null() {
+            let keys: Vec<&String> = meta.as_object().map(|m| m.keys().collect()).unwrap_or_default();
+            tracing::info!(tool = %call.tool, ?keys, "call meta has no session_id");
+        }
+        CALLER_SESSION.scope(session, self.0.dispatch(call)).await
     }
 }
 

@@ -11,7 +11,7 @@ use zyris::{ErrorCode, Payload};
 
 pub use dto::*;
 pub mod schema;
-pub use schema::{Portable, portable};
+pub use schema::{Portable, caller_session, portable};
 
 use crate::app::{App, value_account};
 use crate::broker::{OrderError, OrderRequest, OrderType, Tif};
@@ -58,28 +58,28 @@ pub trait Trader {
     async fn place_order(&self, order: OrderInput) -> zyris::Result<PlaceResult>;
 
     /// Cancel an open order; its unfilled part is released.
-    async fn cancel_order(&self, account: String, order_id: u64) -> zyris::Result<OrderView>;
+    async fn cancel_order(&self, account: Option<String>, order_id: u64) -> zyris::Result<OrderView>;
 
     /// Orders of an account, newest first. `open_only` shows resting orders only; `limit`
     /// default 50, at most 200.
-    async fn list_orders(&self, account: String, open_only: Option<bool>, limit: Option<u32>) -> zyris::Result<Vec<OrderView>>;
+    async fn list_orders(&self, account: Option<String>, open_only: Option<bool>, limit: Option<u32>) -> zyris::Result<Vec<OrderView>>;
 
     /// Executions of an account, newest first, optionally only after `since`. `limit` default
     /// 50, at most 200.
-    async fn list_fills(&self, account: String, since: Option<DateTime<Utc>>, limit: Option<u32>) -> zyris::Result<Vec<FillView>>;
+    async fn list_fills(&self, account: Option<String>, since: Option<DateTime<Utc>>, limit: Option<u32>) -> zyris::Result<Vec<FillView>>;
 
-    /// Accounts you may trade.
+    /// Accounts you may trade. Every tool's `account` may be left out while there is only one.
     async fn list_accounts(&self) -> zyris::Result<Vec<AccountInfo>>;
 
     /// Cash per currency, positions value and total equity in KRW.
-    async fn get_account(&self, account: String) -> zyris::Result<AccountSummary>;
+    async fn get_account(&self, account: Option<String>) -> zyris::Result<AccountSummary>;
 
     /// Holdings with average cost, current price, unrealized profit and portfolio weight.
-    async fn get_positions(&self, account: String) -> zyris::Result<Vec<PositionView>>;
+    async fn get_positions(&self, account: Option<String>) -> zyris::Result<Vec<PositionView>>;
 
     /// Exchange cash between KRW, USD and USDT at the reference rate less a 0.1% spread. USD
     /// buys US stocks, USDT buys Binance coins, KRW buys KRX stocks and Upbit coins.
-    async fn convert_currency(&self, account: String, from: String, to: String, amount: Decimal) -> zyris::Result<ConversionView>;
+    async fn convert_currency(&self, account: Option<String>, from: String, to: String, amount: Decimal) -> zyris::Result<ConversionView>;
 
     /// OHLCV candles, oldest first (the last may still be forming). `interval`: 1m, 5m, 15m, 1h,
     /// 1d, 1w. `limit` default 100, at most 200; KRX/US daily and weekly candles return at most
@@ -98,7 +98,7 @@ pub trait Trader {
 
     /// Account performance over `period`: 1d, 1w, 1m, 3m or all — return, max drawdown,
     /// volatility, Sharpe, win rate, realized profit, fees and turnover (KRW).
-    async fn get_performance(&self, account: String, period: String) -> zyris::Result<PerformanceView>;
+    async fn get_performance(&self, account: Option<String>, period: String) -> zyris::Result<PerformanceView>;
 
     /// Company financials: up to 3 fiscal years and the latest quarter (revenue, operating and
     /// net income, EPS, equity), shares outstanding, and PER/PBR at the current price. KRX
@@ -116,19 +116,17 @@ pub trait Trader {
     /// Get woken up when something happens: a price level, a % move, a volume surge, one of
     /// your orders filling, or a stock market opening/closing. When it fires, this account's
     /// Attacca session receives a message with your note. At most 50 active alerts per account.
-    async fn create_alert(&self, account: String, alert: AlertInput) -> zyris::Result<AlertView>;
+    async fn create_alert(&self, account: Option<String>, alert: AlertInput) -> zyris::Result<AlertView>;
 
     /// Active alerts of an account.
-    async fn list_alerts(&self, account: String) -> zyris::Result<Vec<AlertView>>;
+    async fn list_alerts(&self, account: Option<String>) -> zyris::Result<Vec<AlertView>>;
 
     /// Turn an alert off.
-    async fn delete_alert(&self, account: String, alert_id: i64) -> zyris::Result<AlertView>;
+    async fn delete_alert(&self, account: Option<String>, alert_id: i64) -> zyris::Result<AlertView>;
 }
 
 pub struct TraderTools {
     app: Arc<App>,
-    /// The dashboard sees every account; the agent only those with an `agent_id`.
-    any_account: bool,
 }
 
 impl TraderTools {
@@ -162,18 +160,24 @@ impl TraderTools {
     }
 
     pub fn new(app: Arc<App>) -> Self {
-        TraderTools { app, any_account: false }
+        TraderTools { app }
     }
 
-    pub fn for_dashboard(app: Arc<App>) -> Self {
-        TraderTools { app, any_account: true }
-    }
-
-    fn account(&self, id: &str) -> zyris::Result<crate::store::AccountRow> {
-        if self.any_account {
-            self.app.account(id).ok_or_else(|| order_error(OrderError::UnknownAccount))
-        } else {
-            self.app.agent_account(id)
+    /// The named account, or the only one when `id` is left out.
+    fn account(&self, id: Option<&str>) -> zyris::Result<crate::store::AccountRow> {
+        match id.map(str::trim).filter(|i| !i.is_empty()) {
+            Some(id) => self.app.account(id).ok_or_else(|| order_error(OrderError::UnknownAccount)),
+            None => {
+                let all = self.app.accounts();
+                match all.as_slice() {
+                    [only] => Ok(only.clone()),
+                    [] => Err(order_error(OrderError::UnknownAccount)),
+                    many => {
+                        let list: Vec<String> = many.iter().map(|a| format!("{} ({})", a.id, a.name)).collect();
+                        Err(bad(format!("say which account: {}", list.join(", "))))
+                    }
+                }
+            }
         }
     }
 }
@@ -301,7 +305,7 @@ impl TraderTools {
         Ok(id)
     }
 
-    async fn valuation(&self, account: &str) -> zyris::Result<(AccountSummary, Vec<PositionView>)> {
+    async fn valuation(&self, account: Option<&str>) -> zyris::Result<(AccountSummary, Vec<PositionView>)> {
         let row = self.account(account)?;
         let pf = self.app.broker.portfolio(&row.id).ok_or_else(|| order_error(OrderError::UnknownAccount))?;
         let usd_krw = self.app.fx.usd_krw().await.map_err(|e| upstream(format!("{e:#}")))?;
@@ -452,7 +456,7 @@ impl Trader for TraderTools {
     }
 
     async fn estimate_order(&self, order: OrderInput) -> zyris::Result<EstimateView> {
-        let row = self.account(&order.account)?;
+        let row = self.account(order.account.as_deref())?;
         let req = to_request(&order)?;
         self.known(&order.instrument)?;
         self.app.market.ensure_fresh(&req.instrument).await.map_err(|e| upstream(format!("{e:#}")))?;
@@ -460,7 +464,7 @@ impl Trader for TraderTools {
     }
 
     async fn place_order(&self, order: OrderInput) -> zyris::Result<PlaceResult> {
-        let row = self.account(&order.account)?;
+        let row = self.account(order.account.as_deref())?;
         let req = to_request(&order)?;
         self.known(&order.instrument)?;
         self.app.market.ensure_fresh(&req.instrument).await.map_err(|e| upstream(format!("{e:#}")))?;
@@ -469,15 +473,15 @@ impl Trader for TraderTools {
         Ok(PlaceResult { order: OrderView::from(&placed), fills: fills.iter().map(FillView::from).collect() })
     }
 
-    async fn cancel_order(&self, account: String, order_id: u64) -> zyris::Result<OrderView> {
-        let row = self.account(&account)?;
+    async fn cancel_order(&self, account: Option<String>, order_id: u64) -> zyris::Result<OrderView> {
+        let row = self.account(account.as_deref())?;
         let order = self.app.broker.cancel_sync(&row.id, order_id).map_err(order_error)?;
         self.app.market.refresh_pins();
         Ok(OrderView::from(&order))
     }
 
-    async fn list_orders(&self, account: String, open_only: Option<bool>, limit: Option<u32>) -> zyris::Result<Vec<OrderView>> {
-        let row = self.account(&account)?;
+    async fn list_orders(&self, account: Option<String>, open_only: Option<bool>, limit: Option<u32>) -> zyris::Result<Vec<OrderView>> {
+        let row = self.account(account.as_deref())?;
         let orders = self
             .app
             .store
@@ -487,8 +491,8 @@ impl Trader for TraderTools {
         Ok(orders.iter().map(OrderView::from).collect())
     }
 
-    async fn list_fills(&self, account: String, since: Option<DateTime<Utc>>, limit: Option<u32>) -> zyris::Result<Vec<FillView>> {
-        let row = self.account(&account)?;
+    async fn list_fills(&self, account: Option<String>, since: Option<DateTime<Utc>>, limit: Option<u32>) -> zyris::Result<Vec<FillView>> {
+        let row = self.account(account.as_deref())?;
         let fills = self.app.store.fills(&row.id, row.generation, since, clamp_limit(limit)).await.map_err(upstream)?;
         Ok(fills.iter().map(FillView::from).collect())
     }
@@ -496,22 +500,22 @@ impl Trader for TraderTools {
     async fn list_accounts(&self) -> zyris::Result<Vec<AccountInfo>> {
         Ok(self
             .app
-            .agent_accounts()
+            .accounts()
             .into_iter()
             .map(|r| AccountInfo { id: r.id, name: r.name, generation: r.generation })
             .collect())
     }
 
-    async fn get_account(&self, account: String) -> zyris::Result<AccountSummary> {
-        Ok(self.valuation(&account).await?.0)
+    async fn get_account(&self, account: Option<String>) -> zyris::Result<AccountSummary> {
+        Ok(self.valuation(account.as_deref()).await?.0)
     }
 
-    async fn get_positions(&self, account: String) -> zyris::Result<Vec<PositionView>> {
-        Ok(self.valuation(&account).await?.1)
+    async fn get_positions(&self, account: Option<String>) -> zyris::Result<Vec<PositionView>> {
+        Ok(self.valuation(account.as_deref()).await?.1)
     }
 
-    async fn convert_currency(&self, account: String, from: String, to: String, amount: Decimal) -> zyris::Result<ConversionView> {
-        let row = self.account(&account)?;
+    async fn convert_currency(&self, account: Option<String>, from: String, to: String, amount: Decimal) -> zyris::Result<ConversionView> {
+        let row = self.account(account.as_deref())?;
         let (from, to) = (parse_currency(&from)?, parse_currency(&to)?);
         let usd_krw = self.app.fx.usd_krw().await.map_err(|e| upstream(format!("{e:#}")))?;
         let c = self.app.broker.convert_sync(&row.id, from, to, amount, usd_krw, self.app.fx_spread).map_err(order_error)?;
@@ -564,8 +568,8 @@ impl Trader for TraderTools {
             .collect())
     }
 
-    async fn get_performance(&self, account: String, period: String) -> zyris::Result<PerformanceView> {
-        let row = self.account(&account)?;
+    async fn get_performance(&self, account: Option<String>, period: String) -> zyris::Result<PerformanceView> {
+        let row = self.account(account.as_deref())?;
         let days = match period.as_str() {
             "1d" => Some(1),
             "1w" => Some(7),
@@ -663,8 +667,8 @@ impl Trader for TraderTools {
         Ok(FilingText { filing_id, page, pages: pages as u32, text: chunk })
     }
 
-    async fn create_alert(&self, account: String, alert: AlertInput) -> zyris::Result<AlertView> {
-        let row = self.account(&account)?;
+    async fn create_alert(&self, account: Option<String>, alert: AlertInput) -> zyris::Result<AlertView> {
+        let row = self.account(account.as_deref())?;
         let condition = self.alert_condition(&alert)?;
         if alert.note.trim().is_empty() {
             return Err(bad("note is required: say what you want to do when it fires"));
@@ -684,20 +688,24 @@ impl Trader for TraderTools {
             last_fired_at: None,
         };
         a.id = self.app.store.create_alert(&a).await.map_err(upstream)?;
+        // Alerts on this account now go back to the conversation that set this one.
+        if let Some(session) = caller_session() {
+            self.app.store.set_alert_session(&row.id, &session).await.map_err(upstream)?;
+        }
         if let Some(tx) = &self.app.alerts {
             let _ = tx.send(crate::alerts::deliver::AlertCmd::Upsert(a.clone()));
         }
         Ok(AlertView::from_alert(&a, true))
     }
 
-    async fn list_alerts(&self, account: String) -> zyris::Result<Vec<AlertView>> {
-        let row = self.account(&account)?;
+    async fn list_alerts(&self, account: Option<String>) -> zyris::Result<Vec<AlertView>> {
+        let row = self.account(account.as_deref())?;
         let alerts = self.app.store.active_alerts(&row.id, row.generation).await.map_err(upstream)?;
         Ok(alerts.iter().map(|a| AlertView::from_alert(a, true)).collect())
     }
 
-    async fn delete_alert(&self, account: String, alert_id: i64) -> zyris::Result<AlertView> {
-        let row = self.account(&account)?;
+    async fn delete_alert(&self, account: Option<String>, alert_id: i64) -> zyris::Result<AlertView> {
+        let row = self.account(account.as_deref())?;
         let active = self.app.store.active_alerts(&row.id, row.generation).await.map_err(upstream)?;
         let a = active.into_iter().find(|a| a.id == alert_id).ok_or_else(|| order_error(OrderError::NotFound))?;
         self.app.store.deactivate_alert(&row.id, alert_id).await.map_err(upstream)?;

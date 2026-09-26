@@ -25,7 +25,6 @@ export interface AccountSummary {
 
 export interface OverviewRow {
   id: string;
-  agent_id: string | null;
   generation: number;
   summary: AccountSummary;
   day_pnl_krw: Dec | null;
@@ -94,7 +93,6 @@ export interface PerformanceView {
 }
 
 export interface AccountDetail {
-  agent_id: string | null;
   generation: number;
   summary: AccountSummary;
   positions: PositionView[];
@@ -200,10 +198,4 @@ export interface ZyrisStatus {
   enrolled: boolean;
   source: "env" | "file" | "dashboard" | null;
   enrollment: Enrollment;
-}
-
-export interface Agent {
-  id: string;
-  name: string;
-  description: string | null;
 }

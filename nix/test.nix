@@ -14,7 +14,7 @@ self: {
     machine.wait_for_open_port(8750)
     machine.succeed("curl -sf -o /dev/null -w '%{http_code}' http://127.0.0.1:8750/ | grep 200")
     machine.succeed("curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8750/api/overview | grep 401")
-    machine.succeed("atrader-manage account create bot Bot --agent test-agent --cash KRW=1000000")
+    machine.succeed("atrader-manage account create bot Bot --cash KRW=1000000")
     machine.succeed("atrader-manage account list | grep bot")
     machine.succeed("journalctl -u atrader | grep 'fundamentals sources' | grep 'dart=true'")
   '';

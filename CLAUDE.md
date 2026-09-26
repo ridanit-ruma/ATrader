@@ -8,7 +8,7 @@ Spec: `docs/superpowers/specs/2026-09-24-atrader-design.md`. Plans: `docs/superp
 - Build and test (no DB): `cargo test --lib --test broker`
 - Local Postgres: `scripts/dev-db.sh` prints a `DATABASE_URL`; export it, then `cargo test`
 - Run without Attacca: `cargo run -- serve --no-zyris` (needs `DATABASE_URL`; the dev DB also has an `atrader` database: `createdb -h 127.0.0.1 -p 54329 -U atrader atrader`)
-- Accounts: `cargo run -- account create <id> <name> --agent <agent-id>`, `cargo run -- account list`
+- Accounts: `cargo run -- account create <id> <name>`, `cargo run -- account list`
 - Live network smoke tests: `cargo test --test live -- --ignored`
 - Dashboard: `cd web && npm ci && npm run build` (the binary embeds `web/dist`); `npm run dev` proxies `/api` to `127.0.0.1:8750`; `npm test` runs vitest
 - Nix: `nix build` (package), `nix build .#checks.x86_64-linux.vm` (NixOS VM test of the module). After changing `web/package-lock.json`, update `npmDepsHash` in `nix/package.nix` (`nix run nixpkgs#prefetch-npm-deps -- web/package-lock.json`)

@@ -3,8 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { api } from "@/api";
 import { fmtKrw, fmtNum, fmtPct } from "@/format";
 import { ErrorText, Metric, Muted, PageHeader, Signed, Stat } from "@/components/common";
-import { Badge } from "@/components/ui/badge";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 
 export function Overview() {
   const q = useQuery({ queryKey: ["overview"], queryFn: api.overview });
@@ -31,7 +30,7 @@ export function Overview() {
       <div className="grid gap-4 sm:grid-cols-3">
         <Metric label="전체 평가금액 (원)" value={fmtKrw(total)} trend={dayPct} trendLabel={fmtPct(dayPct)} footer="오늘 00시(KST) 대비" />
         <Metric label="오늘 손익 (원)" value={<Signed value={dayPnl}>{fmtKrw(dayPnl)}</Signed>} footer={`${known.length}개 계좌 기준`} />
-        <Metric label="계좌" value={q.data.length} footer={`에이전트 연결 ${q.data.filter((r) => r.agent_id).length}개`} />
+        <Metric label="계좌" value={q.data.length} />
       </div>
       <div className="grid gap-4 md:grid-cols-2">
         {q.data.map((r) => (
@@ -39,10 +38,6 @@ export function Overview() {
             <Card className="h-full">
               <CardHeader>
                 <CardTitle>{r.summary.name}</CardTitle>
-                <CardDescription className="flex gap-2">
-                  <span>{r.id}</span>
-                  <Badge variant={r.agent_id ? "secondary" : "outline"}>{r.agent_id ? `에이전트 ${r.agent_id}` : "에이전트 없음"}</Badge>
-                </CardDescription>
               </CardHeader>
               <CardContent className="grid gap-3">
                 <div className="grid grid-cols-3 gap-2">

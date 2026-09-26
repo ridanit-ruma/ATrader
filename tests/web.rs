@@ -167,7 +167,7 @@ async fn accounts_are_managed_over_http(pool: PgPool) {
     assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
     let neg = r.clone().oneshot(req("POST", "/api/accounts", Some(&c), Some(serde_json::json!({"id": "neg", "name": "x", "cash": {"KRW": "-1"}})))).await.unwrap();
     assert_eq!(neg.status(), StatusCode::BAD_REQUEST);
-    let ok = r.clone().oneshot(req("POST", "/api/accounts", Some(&c), Some(serde_json::json!({"id": "swing", "name": "Swing", "agent_id": "ag", "cash": {"KRW": "5000000"}})))).await.unwrap();
+    let ok = r.clone().oneshot(req("POST", "/api/accounts", Some(&c), Some(serde_json::json!({"id": "swing", "name": "Swing", "cash": {"KRW": "5000000"}})))).await.unwrap();
     assert_eq!(ok.status(), StatusCode::OK);
     assert_eq!(r.clone().oneshot(req("GET", "/api/accounts/swing", Some(&c), None)).await.unwrap().status(), StatusCode::OK);
     assert_eq!(r.clone().oneshot(req("GET", "/api/accounts/missing", Some(&c), None)).await.unwrap().status(), StatusCode::NOT_FOUND);
@@ -220,23 +220,21 @@ async fn keys_are_write_only_and_saving_asks_for_a_restart(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn an_account_can_be_given_to_an_agent_later(pool: PgPool) {
+async fn new_accounts_need_only_a_name(pool: PgPool) {
     let (r, _, secret) = web(pool).await;
     let c = login(&r, &secret).await;
-    // Not connected to Attacca in tests: the agent list says so instead of failing opaquely.
+    let mk = |name: &str| req("POST", "/api/accounts", Some(&c), Some(serde_json::json!({"name": name, "cash": {"KRW": "1000000"}})));
+    let ids: Vec<String> = {
+        let mut out = Vec::new();
+        for name in ["가상 계좌", "가상 계좌", "Swing bot"] {
+            let res = r.clone().oneshot(mk(name)).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let v: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 10_000).await.unwrap()).unwrap();
+            out.push(v["id"].as_str().unwrap().to_string());
+        }
+        out
+    };
+    assert_eq!(ids, vec!["account", "account-2", "swing-bot"]);
     let agents = r.clone().oneshot(req("GET", "/api/agents", Some(&c), None)).await.unwrap();
-    assert_eq!(agents.status(), StatusCode::SERVICE_UNAVAILABLE);
-
-    let missing = r.clone().oneshot(req("PUT", "/api/accounts/nope/agent", Some(&c), Some(serde_json::json!({"agent_id": "ag-2"})))).await.unwrap();
-    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
-    let set = r.clone().oneshot(req("PUT", "/api/accounts/manual/agent", Some(&c), Some(serde_json::json!({"agent_id": "ag-2"})))).await.unwrap();
-    assert_eq!(set.status(), StatusCode::OK);
-    let detail = r.clone().oneshot(req("GET", "/api/accounts/manual", Some(&c), None)).await.unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(detail.into_body(), 100_000).await.unwrap()).unwrap();
-    assert_eq!(v["agent_id"], "ag-2");
-    let clear = r.clone().oneshot(req("PUT", "/api/accounts/manual/agent", Some(&c), Some(serde_json::json!({"agent_id": null})))).await.unwrap();
-    assert_eq!(clear.status(), StatusCode::OK);
-    let detail = r.clone().oneshot(req("GET", "/api/accounts/manual", Some(&c), None)).await.unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(detail.into_body(), 100_000).await.unwrap()).unwrap();
-    assert_eq!(v["agent_id"], serde_json::Value::Null);
+    assert_eq!(agents.status(), StatusCode::NOT_FOUND, "agent ids are gone");
 }

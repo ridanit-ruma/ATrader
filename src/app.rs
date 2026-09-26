@@ -6,12 +6,11 @@ use std::sync::{Arc, RwLock};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
-use crate::broker::{OrderError, SimBroker};
+use crate::broker::SimBroker;
 use crate::domain::Currency;
 use crate::fx::FxCache;
 use crate::market::Market;
 use crate::store::{AccountRow, Store};
-use crate::tools::order_error;
 
 pub struct App {
     pub broker: Arc<SimBroker>,
@@ -44,8 +43,8 @@ impl App {
     }
 
     /// Create an account and make it tradable immediately.
-    pub async fn create_account(&self, id: &str, name: &str, agent: Option<&str>, cash: &[(Currency, Decimal)]) -> anyhow::Result<()> {
-        self.store.create_account(id, name, agent, cash, self.broker.now()).await?;
+    pub async fn create_account(&self, id: &str, name: &str, cash: &[(Currency, Decimal)]) -> anyhow::Result<()> {
+        self.store.create_account(id, name, cash, self.broker.now()).await?;
         self.broker.restore_account(id, crate::ledger::Portfolio::new(cash), 1);
         self.reload_accounts().await
     }
@@ -61,30 +60,19 @@ impl App {
         Ok(generation)
     }
 
-    pub async fn set_account_agent(&self, id: &str, agent: Option<&str>) -> anyhow::Result<()> {
-        anyhow::ensure!(self.store.set_account_agent(id, agent).await?, "no account {id:?}");
-        self.reload_accounts().await
-    }
-
     pub async fn reload_accounts(&self) -> anyhow::Result<()> {
         let rows = self.store.list_accounts().await?;
         *self.accounts.write().unwrap() = rows.into_iter().map(|r| (r.id.clone(), r)).collect();
         Ok(())
     }
 
-    /// Accounts an agent may use: the ones with an agent id, sorted by id.
-    pub fn agent_accounts(&self) -> Vec<AccountRow> {
-        let mut rows: Vec<AccountRow> =
-            self.accounts.read().unwrap().values().filter(|r| r.agent_id.is_some()).cloned().collect();
+    /// Every account, by id.
+    pub fn accounts(&self) -> Vec<AccountRow> {
+        let mut rows: Vec<AccountRow> = self.accounts.read().unwrap().values().cloned().collect();
         rows.sort_by(|a, b| a.id.cmp(&b.id));
         rows
     }
 
-    pub fn agent_account(&self, id: &str) -> Result<AccountRow, zyris::Error> {
-        self.account(id).filter(|r| r.agent_id.is_some()).ok_or_else(|| order_error(OrderError::UnknownAccount))
-    }
-
-    /// Any account, agent-traded or not.
     pub fn account(&self, id: &str) -> Option<AccountRow> {
         self.accounts.read().unwrap().get(id).cloned()
     }

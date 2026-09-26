@@ -24,7 +24,7 @@ const USAGE: &str = "atrader — paper trading for Attacca agents
 
 USAGE:
   atrader serve [--no-zyris]
-  atrader account create <id> <name> [--agent <attacca-agent-id>] [--cash KRW=10000000]...
+  atrader account create <id> <name> [--cash KRW=10000000]...
   atrader account list
   atrader account reset <id> [--cash KRW=10000000]...
   atrader user create <username>
@@ -49,7 +49,7 @@ ENVIRONMENT:
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Serve { zyris: bool },
-    AccountCreate { id: String, name: String, agent: Option<String>, cash: Vec<(Currency, Decimal)> },
+    AccountCreate { id: String, name: String, cash: Vec<(Currency, Decimal)> },
     AccountList,
     AccountReset { id: String, cash: Vec<(Currency, Decimal)> },
     UserCreate { username: String },
@@ -73,19 +73,18 @@ fn parse_cash(s: &str) -> Result<(Currency, Decimal), String> {
     Ok((c, amount))
 }
 
-/// `--agent X` and repeated `--cash C=N` after the positional arguments.
-fn parse_flags(rest: &[String]) -> Result<(Option<String>, Vec<(Currency, Decimal)>), String> {
-    let (mut agent, mut cash) = (None, Vec::new());
+/// Repeated `--cash C=N` after the positional arguments.
+fn parse_flags(rest: &[String]) -> Result<Vec<(Currency, Decimal)>, String> {
+    let mut cash = Vec::new();
     let mut it = rest.iter();
     while let Some(flag) = it.next() {
         let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
         match flag.as_str() {
-            "--agent" => agent = Some(value.clone()),
             "--cash" => cash.push(parse_cash(value)?),
             other => return Err(format!("unknown option {other}")),
         }
     }
-    Ok((agent, if cash.is_empty() { default_cash() } else { cash }))
+    Ok(if cash.is_empty() { default_cash() } else { cash })
 }
 
 pub fn parse(args: &[String]) -> Result<Command, String> {
@@ -97,17 +96,14 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         ["serve", "--no-zyris"] => Ok(Command::Serve { zyris: false }),
         ["account", "list"] => Ok(Command::AccountList),
         ["account", "create", id, name, ..] => {
-            let (agent, cash) = parse_flags(&args[4..])?;
-            Ok(Command::AccountCreate { id: id.to_string(), name: name.to_string(), agent, cash })
+            let cash = parse_flags(&args[4..])?;
+            Ok(Command::AccountCreate { id: id.to_string(), name: name.to_string(), cash })
         }
         ["user", "create", name] => Ok(Command::UserCreate { username: name.to_string() }),
         ["user", "reset-2fa", name] => Ok(Command::UserReset2fa { username: name.to_string() }),
         ["zyris", "enroll"] => Ok(Command::ZyrisEnroll),
         ["account", "reset", id, ..] => {
-            let (agent, cash) = parse_flags(&args[3..])?;
-            if agent.is_some() {
-                return Err("reset does not take --agent".into());
-            }
+            let cash = parse_flags(&args[3..])?;
             Ok(Command::AccountReset { id: id.to_string(), cash })
         }
         _ => Err(format!("unrecognised command: {}\n\n{USAGE}", words.join(" "))),
@@ -139,8 +135,8 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
         let url = crate::secret_env("DATABASE_URL").context("DATABASE_URL (or DATABASE_URL_FILE) is not set")?;
         let store = Arc::new(Store::connect(&url).await?);
         match command {
-            Command::AccountCreate { id, name, agent, cash } => {
-                store.create_account(&id, &name, agent.as_deref(), &cash, chrono::Utc::now()).await?;
+            Command::AccountCreate { id, name, cash } => {
+                store.create_account(&id, &name, &cash, chrono::Utc::now()).await?;
                 println!("created account {id}");
             }
             Command::AccountList => {
@@ -148,10 +144,9 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
                     let cash = store.cash_balances(&a.id, a.generation).await?;
                     let cash: Vec<String> = cash.iter().map(|(c, v)| format!("{}={v}", c.code())).collect();
                     println!(
-                        "{:<16} {:<24} agent={:<24} gen={} {}",
+                        "{:<16} {:<24} gen={} {}",
                         a.id,
                         a.name,
-                        a.agent_id.as_deref().unwrap_or("-"),
                         a.generation,
                         cash.join(" ")
                     );
@@ -241,8 +236,6 @@ async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
 
     let addr: std::net::SocketAddr = std::env::var("ATRADER_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:8750".into()).parse().context("ATRADER_HTTP_ADDR")?;
     let web = crate::web::WebState::new(app.clone(), crate::web::auth::AuthStore(app.store.pool().clone()), true).with_bus(bus.clone());
-    let mut web = web;
-    web.attacca = slot.clone();
     let zyris_connected = web.zyris_connected.clone();
     let restart = web.restart.clone();
     tokio::spawn(async move {
@@ -335,9 +328,9 @@ async fn finish(broker: &SimBroker, writer: tokio::task::JoinHandle<()>, restart
     Ok(())
 }
 
-/// Scopes the credential is issued with; they never widen later. Alerts open a session with the
-/// account's agent and post to it.
-const ENROLL_SCOPES: [&str; 3] = ["agents:read", "sessions:read", "sessions:write"];
+/// Scopes the credential is issued with; they never widen later. Alerts post to the conversation
+/// that set them.
+const ENROLL_SCOPES: [&str; 2] = ["sessions:read", "sessions:write"];
 
 pub fn zyris_server() -> String {
     std::env::var("ZYRIS_SERVER_URL").unwrap_or_else(|_| zyris::DEFAULT_SERVER_URL.to_string())
@@ -413,11 +406,10 @@ mod tests {
         assert_eq!(parse(&args(&["serve", "--no-zyris"])), Ok(Command::Serve { zyris: false }));
         assert_eq!(parse(&args(&["account", "list"])), Ok(Command::AccountList));
         assert_eq!(
-            parse(&args(&["account", "create", "bot", "My Bot", "--agent", "ag1", "--cash", "KRW=10000000", "--cash", "usd=1000"])),
+            parse(&args(&["account", "create", "bot", "My Bot", "--cash", "KRW=10000000", "--cash", "usd=1000"])),
             Ok(Command::AccountCreate {
                 id: "bot".into(),
                 name: "My Bot".into(),
-                agent: Some("ag1".into()),
                 cash: vec![(Currency::Krw, dec!(10000000)), (Currency::Usd, dec!(1000))],
             })
         );
@@ -444,7 +436,7 @@ mod tests {
         assert!(parse(&args(&["account", "create", "bot", "Bot", "--cash", "KRW10"])).is_err());
         assert!(parse(&args(&["account", "create", "bot", "Bot", "--cash", "EUR=5"])).is_err());
         assert!(parse(&args(&["account", "create", "bot", "Bot", "--cash", "KRW=-5"])).is_err());
-        assert!(parse(&args(&["account", "create", "bot", "Bot", "--agent"])).is_err());
+        assert!(parse(&args(&["account", "create", "bot", "Bot", "--agent", "ag1"])).is_err());
         assert!(parse(&args(&["serve", "--fast"])).is_err());
     }
 }

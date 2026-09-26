@@ -13,7 +13,7 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use futures_util::{Stream, StreamExt, stream};
@@ -46,8 +46,6 @@ pub struct WebState {
     /// Where dashboard-entered keys are stored (`<dir>/settings/NAME`).
     pub settings_dir: std::path::PathBuf,
     pub enrollment: Arc<Mutex<EnrollView>>,
-    /// The live Attacca connection (set by the zyris link), for listing agents.
-    pub attacca: crate::alerts::deliver::ConnSlot,
 }
 
 /// Where the dashboard's Attacca enrollment stands.
@@ -80,7 +78,6 @@ impl WebState {
             restart: Arc::default(),
             settings_dir: crate::settings::state_dir(),
             enrollment: Arc::default(),
-            attacca: Default::default(),
         }
     }
 
@@ -90,7 +87,7 @@ impl WebState {
     }
 
     fn tools(&self) -> TraderTools {
-        TraderTools::for_dashboard(self.app.clone())
+        TraderTools::new(self.app.clone())
     }
 }
 
@@ -391,30 +388,47 @@ fn valid_account_id(id: &str) -> bool {
 
 #[derive(Deserialize)]
 struct NewAccount {
-    id: String,
-    name: String,
+    /// Left out by the dashboard: one is made from the name.
     #[serde(default)]
-    agent_id: Option<String>,
+    id: Option<String>,
+    name: String,
     cash: HashMap<String, Decimal>,
+}
+
+/// An id from `name` (`Swing bot` → `swing-bot`; `account` when nothing ASCII is left), made
+/// unique with `-2`, `-3`, ….
+fn account_id_for(name: &str, taken: impl Fn(&str) -> bool) -> String {
+    let mut slug = String::new();
+    for c in name.to_ascii_lowercase().chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c);
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let mut base: String = slug.trim_end_matches('-').chars().take(24).collect();
+    if base.is_empty() {
+        base = "account".into();
+    }
+    (1..).map(|n| if n == 1 { base.clone() } else { format!("{base}-{n}") }).find(|id| !taken(id)).expect("some suffix is free")
 }
 
 async fn create_account(State(s): State<WebState>, peer: Peer, headers: HeaderMap, Json(b): Json<NewAccount>) -> ApiResult {
     let (user, _) = authed(&s, &headers, false).await?;
-    if !valid_account_id(&b.id) {
-        return Err(bad_request("id must be 1-32 characters of a-z, 0-9, _ and -"));
-    }
     let name = b.name.trim();
     if name.is_empty() || name.chars().count() > 100 {
         return Err(bad_request("name must be 1-100 characters"));
     }
+    let id = match b.id.as_deref().map(str::trim).filter(|i| !i.is_empty()) {
+        Some(id) if !valid_account_id(id) => return Err(bad_request("id must be 1-32 characters of a-z, 0-9, _ and -")),
+        Some(id) if s.app.account(id).is_some() => return Err(ApiError(StatusCode::CONFLICT, "exists", format!("account {id:?} already exists"))),
+        Some(id) => id.to_string(),
+        None => account_id_for(name, |id| s.app.account(id).is_some()),
+    };
     let cash = parse_cash(&b.cash)?;
-    if s.app.account(&b.id).is_some() {
-        return Err(ApiError(StatusCode::CONFLICT, "exists", format!("account {:?} already exists", b.id)));
-    }
-    let agent = b.agent_id.as_deref().map(str::trim).filter(|a| !a.is_empty());
-    s.app.create_account(&b.id, name, agent, &cash).await.map_err(internal)?;
-    let _ = s.auth.audit(Some(user.id), "account_create", &b.id, &peer_ip(&headers, peer)).await;
-    Ok(Json(json!({"id": b.id})))
+    s.app.create_account(&id, name, &cash).await.map_err(internal)?;
+    let _ = s.auth.audit(Some(user.id), "account_create", &id, &peer_ip(&headers, peer)).await;
+    Ok(Json(json!({"id": id})))
 }
 
 #[derive(Deserialize)]
@@ -431,34 +445,6 @@ async fn reset_account(State(s): State<WebState>, peer: Peer, headers: HeaderMap
     Ok(Json(json!({"id": id, "generation": generation})))
 }
 
-/// The Attacca agents this node's credential can see, to pick an account's agent from.
-async fn agents(State(s): State<WebState>, headers: HeaderMap) -> ApiResult {
-    use zyris_attacca::{AttaccaApi, AttaccaApiClient};
-    authed(&s, &headers, false).await?;
-    let unavailable = |m: String| ApiError(StatusCode::SERVICE_UNAVAILABLE, "not_connected", m);
-    let conn = s.attacca.get().ok_or_else(|| unavailable("not connected to Attacca".into()))?;
-    let api = conn.wait_capability::<AttaccaApiClient>(std::time::Duration::from_secs(5)).await.map_err(|e| unavailable(e.to_string()))?;
-    let list = api.list_agents().await.map_err(|e| ApiError(StatusCode::BAD_GATEWAY, "upstream", e.message))?;
-    Ok(Json(Value::Array(list.into_iter().map(|a| json!({"id": a.id, "name": a.name, "description": a.description})).collect())))
-}
-
-#[derive(Deserialize)]
-struct AgentBody {
-    agent_id: Option<String>,
-}
-
-async fn set_agent(State(s): State<WebState>, peer: Peer, headers: HeaderMap, Path(id): Path<String>, Json(b): Json<AgentBody>) -> ApiResult {
-    let (user, _) = authed(&s, &headers, false).await?;
-    row(&s, &id)?;
-    let agent = b.agent_id.as_deref().map(str::trim).filter(|a| !a.is_empty());
-    if agent.is_some_and(|a| a.len() > 128 || a.chars().any(char::is_control)) {
-        return Err(bad_request("agent id is too long or has control characters"));
-    }
-    s.app.set_account_agent(&id, agent).await.map_err(internal)?;
-    let _ = s.auth.audit(Some(user.id), "account_agent", &format!("{id} -> {}", agent.unwrap_or("-")), &peer_ip(&headers, peer)).await;
-    Ok(Json(json!({"id": id, "agent_id": agent})))
-}
-
 fn kst_midnight(now: DateTime<Utc>) -> DateTime<Utc> {
     let day = now.with_timezone(&chrono_tz::Asia::Seoul).date_naive();
     chrono_tz::Asia::Seoul.from_local_datetime(&day.and_hms_opt(0, 0, 0).expect("midnight")).single().map_or(now, |t| t.with_timezone(&Utc))
@@ -470,11 +456,11 @@ async fn overview(State(s): State<WebState>, headers: HeaderMap) -> ApiResult {
     let midnight = kst_midnight(Utc::now());
     let mut out = Vec::new();
     for r in s.app.store.list_accounts().await.map_err(internal)? {
-        let summary = t.get_account(r.id.clone()).await.map_err(tool_error)?;
+        let summary = t.get_account(Some(r.id.clone())).await.map_err(tool_error)?;
         let open = s.app.store.snapshots(&r.id, r.generation, Some(midnight), true).await.map_err(internal)?;
         let day_pnl = open.first().map(|o| summary.equity_krw - o.equity_krw);
-        let total = t.get_performance(r.id.clone(), "all".into()).await.ok().map(|p| p.return_pct);
-        out.push(json!({"id": r.id, "agent_id": r.agent_id, "generation": r.generation, "summary": summary, "day_pnl_krw": day_pnl, "total_return_pct": total}));
+        let total = t.get_performance(Some(r.id.clone()), "all".into()).await.ok().map(|p| p.return_pct);
+        out.push(json!({"id": r.id, "generation": r.generation, "summary": summary, "day_pnl_krw": day_pnl, "total_return_pct": total}));
     }
     Ok(Json(Value::Array(out)))
 }
@@ -484,12 +470,11 @@ async fn account(State(s): State<WebState>, headers: HeaderMap, Path(id): Path<S
     let r = row(&s, &id)?;
     let t = s.tools();
     Ok(Json(json!({
-        "agent_id": r.agent_id,
         "generation": r.generation,
-        "summary": t.get_account(id.clone()).await.map_err(tool_error)?,
-        "positions": t.get_positions(id.clone()).await.map_err(tool_error)?,
-        "open_orders": t.list_orders(id.clone(), Some(true), Some(200)).await.map_err(tool_error)?,
-        "performance_all": t.get_performance(id, "all".into()).await.ok(),
+        "summary": t.get_account(Some(id.clone())).await.map_err(tool_error)?,
+        "positions": t.get_positions(Some(id.clone())).await.map_err(tool_error)?,
+        "open_orders": t.list_orders(Some(id.clone()), Some(true), Some(200)).await.map_err(tool_error)?,
+        "performance_all": t.get_performance(Some(id), "all".into()).await.ok(),
     })))
 }
 
@@ -523,7 +508,7 @@ struct LimitQuery {
 async fn fills(State(s): State<WebState>, headers: HeaderMap, Path(id): Path<String>, Query(q): Query<LimitQuery>) -> ApiResult {
     authed(&s, &headers, false).await?;
     let r = row(&s, &id)?;
-    let fills = s.tools().list_fills(id.clone(), None, q.limit).await.map_err(tool_error)?;
+    let fills = s.tools().list_fills(Some(id.clone()), None, q.limit).await.map_err(tool_error)?;
     let reasons: HashMap<u64, String> =
         s.app.store.orders(&id, r.generation, false, 1000).await.map_err(internal)?.into_iter().map(|o| (o.id, o.req.reason)).collect();
     let mut out = Vec::with_capacity(fills.len());
@@ -538,7 +523,7 @@ async fn fills(State(s): State<WebState>, headers: HeaderMap, Path(id): Path<Str
 
 async fn orders(State(s): State<WebState>, headers: HeaderMap, Path(id): Path<String>, Query(q): Query<LimitQuery>) -> ApiResult {
     authed(&s, &headers, false).await?;
-    Ok(Json(to_json(s.tools().list_orders(id, q.open_only, q.limit).await.map_err(tool_error)?)?))
+    Ok(Json(to_json(s.tools().list_orders(Some(id), q.open_only, q.limit).await.map_err(tool_error)?)?))
 }
 
 async fn pnl(State(s): State<WebState>, headers: HeaderMap, Path(id): Path<String>) -> ApiResult {
@@ -546,7 +531,7 @@ async fn pnl(State(s): State<WebState>, headers: HeaderMap, Path(id): Path<Strin
     let r = row(&s, &id)?;
     let seoul = |t: DateTime<Utc>| t.with_timezone(&chrono_tz::Asia::Seoul).date_naive();
     let days = s.app.store.snapshots(&id, r.generation, None, true).await.map_err(internal)?;
-    let now_equity = s.tools().get_account(id.clone()).await.map_err(tool_error)?.equity_krw;
+    let now_equity = s.tools().get_account(Some(id.clone())).await.map_err(tool_error)?.equity_krw;
     // Each daily snapshot opens its day; the next one (or the live equity, for today) closes it.
     let closes = days.iter().skip(1).map(|d| d.equity_krw).chain([now_equity]);
     let daily: Vec<Value> = days.iter().zip(closes).map(|(open, close)| json!({"date": seoul(open.at), "pnl_krw": close - open.equity_krw})).collect();
@@ -562,7 +547,7 @@ async fn pnl(State(s): State<WebState>, headers: HeaderMap, Path(id): Path<Strin
 
 async fn alerts(State(s): State<WebState>, headers: HeaderMap, Path(id): Path<String>) -> ApiResult {
     authed(&s, &headers, false).await?;
-    Ok(Json(to_json(s.tools().list_alerts(id).await.map_err(tool_error)?)?))
+    Ok(Json(to_json(s.tools().list_alerts(Some(id)).await.map_err(tool_error)?)?))
 }
 
 #[derive(Deserialize)]
@@ -822,8 +807,6 @@ pub fn router(state: WebState) -> Router {
         .route("/api/accounts", post(create_account))
         .route("/api/accounts/{id}", get(account))
         .route("/api/accounts/{id}/reset", post(reset_account))
-        .route("/api/accounts/{id}/agent", put(set_agent))
-        .route("/api/agents", get(agents))
         .route("/api/accounts/{id}/equity", get(equity))
         .route("/api/accounts/{id}/fills", get(fills))
         .route("/api/accounts/{id}/orders", get(orders))
@@ -845,4 +828,15 @@ pub async fn serve_http(state: WebState, addr: SocketAddr) -> anyhow::Result<()>
     tracing::info!(%addr, "dashboard listening");
     axum::serve(listener, router(state).into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn account_ids_come_from_names() {
+        let none = |_: &str| false;
+        assert_eq!(super::account_id_for("Swing bot!", none), "swing-bot");
+        assert_eq!(super::account_id_for("가상 계좌", none), "account");
+        assert_eq!(super::account_id_for("가상 계좌", |id| id == "account" || id == "account-2"), "account-3");
+    }
 }

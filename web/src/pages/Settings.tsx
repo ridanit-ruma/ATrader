@@ -12,7 +12,6 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { TableCell, TableRow } from "@/components/ui/table";
 import { AttaccaConnection, DataKeys } from "@/pages/Connections";
-import { AgentPicker } from "@/components/AgentPicker";
 
 const CURRENCIES = ["KRW", "USD", "USDT"] as const;
 
@@ -43,13 +42,13 @@ function Done({ show, children }: { show: boolean; children: string }) {
 
 function CreateAccount() {
   const qc = useQueryClient();
-  const [f, setF] = useState({ id: "", name: "", agent: "" });
+  const [name, setName] = useState("");
   const [cash, setCash] = useState<Cash>({ KRW: "10000000" });
   const m = useMutation({
-    mutationFn: () => api.createAccount(f.id.trim(), f.name.trim(), f.agent.trim(), nonEmpty(cash)),
+    mutationFn: () => api.createAccount(name.trim(), nonEmpty(cash)),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["overview"] });
-      setF({ id: "", name: "", agent: "" });
+      setName("");
     },
   });
   const submit = (e: FormEvent) => {
@@ -59,15 +58,9 @@ function CreateAccount() {
   return (
     <Section title="계좌 만들기">
       <form onSubmit={submit} className="grid gap-4">
-        <div className="grid gap-2 md:grid-cols-3">
-          <Field id="new-id" label="id (a-z, 0-9, _, -)" value={f.id} onChange={(e) => setF({ ...f, id: e.target.value })} required />
-          <Field id="new-name" label="이름" value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} required />
-          <div className="grid gap-2">
-            <Label htmlFor="new-agent">거래할 에이전트</Label>
-            <AgentPicker id="new-agent" value={f.agent} onChange={(agent) => setF({ ...f, agent })} />
-          </div>
-        </div>
+        <Field id="new-name" label="이름" value={name} onChange={(e) => setName(e.target.value)} required />
         <CashInputs prefix="new" cash={cash} onChange={setCash} />
+        <Muted>연결된 Attacca 에이전트는 모든 계좌를 볼 수 있습니다.</Muted>
         <ErrorText error={m.error} />
         <Done show={m.isSuccess}>만들었습니다.</Done>
         <Button type="submit" className="w-fit" disabled={m.isPending}>
@@ -91,7 +84,8 @@ function ResetAccount() {
       setConfirm("");
     },
   });
-  const items = (overview.data ?? []).map((a) => ({ value: a.id, label: `${a.summary.name} (${a.id})` }));
+  const items = (overview.data ?? []).map((a) => ({ value: a.id, label: a.summary.name }));
+  const name = overview.data?.find((a) => a.id === id)?.summary.name ?? "";
   return (
     <Section title="계좌 초기화">
       <div className="grid gap-4">
@@ -109,10 +103,10 @@ function ResetAccount() {
           </SelectContent>
         </Select>
         <CashInputs prefix="reset" cash={cash} onChange={setCash} />
-        <Field id="reset-confirm" label="확인을 위해 계좌 id를 입력하세요" value={confirm} onChange={(e) => setConfirm(e.target.value)} />
+        <Field id="reset-confirm" label="확인을 위해 계좌 이름을 입력하세요" placeholder={name} value={confirm} onChange={(e) => setConfirm(e.target.value)} />
         <ErrorText error={m.error} />
         <Done show={m.isSuccess}>초기화했습니다.</Done>
-        <Button variant="destructive" className="w-fit" disabled={!id || confirm !== id || m.isPending} onClick={() => m.mutate()}>
+        <Button variant="destructive" className="w-fit" disabled={!id || confirm.trim() !== name || m.isPending} onClick={() => m.mutate()}>
           초기화
         </Button>
       </div>

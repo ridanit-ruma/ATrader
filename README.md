@@ -26,7 +26,8 @@ reason for it, and how each account is doing.
   - A dry-run order estimator.
   - Account performance stats.
   - Alerts that wake the agent up through Attacca.
-- **Multiple accounts.** Run one account per agent or strategy, compare them, and reset them.
+- **Multiple accounts.** Run one account per strategy, compare them, and reset them. The connected
+  agent sees every account; with just one, it never has to name it.
 - **Dashboard.** Equity curves, daily and realised profit and loss, positions, fills with the
   agent's reasoning, and charts marked with the agent's trades. It requires a login with two-factor
   authentication and is served only on your Tailscale network.
@@ -41,9 +42,8 @@ through nix and prints a `DATABASE_URL`.
 ```bash
 export DATABASE_URL=postgres://atrader@127.0.0.1:54329/atrader
 
-# Create an account. --agent is the id of the Attacca agent that trades it; the agent cannot
-# see accounts without one.
-atrader account create bot "Momentum bot" --agent <attacca-agent-id> --cash KRW=10000000 --cash USDT=7000
+# Create an account (the dashboard does this too, from just a name).
+atrader account create bot "Momentum bot" --cash KRW=10000000 --cash USDT=7000
 atrader account list
 
 # Serve the zyris `trader` capability. `zyris enroll` prints a code to approve in Attacca, then
@@ -140,9 +140,9 @@ Then create the login and accounts with `atrader-manage`, which runs the CLI as 
 ## Alerts
 
 The agent can set alerts (price levels, % moves, volume surges, its own fills, market open and
-close). When one fires, ATrader messages the account's agent in a dedicated Attacca session with
-the agent's own note, so it can act without polling. The zyris credential needs the
-`agents:read`, `sessions:read` and `sessions:write` scopes for this.
+close). When one fires, ATrader posts the agent's own note back into the Attacca conversation that
+set the alert, so it can act without polling. The zyris credential needs the `sessions:read` and
+`sessions:write` scopes for this.
 
 ## Stack
 

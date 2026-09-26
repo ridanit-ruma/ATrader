@@ -50,7 +50,7 @@ fn fill(order_id: u64, side: Side, qty: rust_decimal::Decimal, notional: rust_de
 #[sqlx::test]
 async fn ledger_and_fill_replay_agree(pool: PgPool) {
     let store = Store::new(pool);
-    store.create_account("a", "Test", None, &[(Currency::Krw, dec!(1000000))], Utc::now()).await.unwrap();
+    store.create_account("a", "Test", &[(Currency::Krw, dec!(1000000))], Utc::now()).await.unwrap();
     store.save_order(&order(1), 1).await.unwrap();
     store.save_fill(&fill(1, Side::Buy, dec!(10), dec!(700000), dec!(105), dec!(0)), 1).await.unwrap();
     store.save_order(&order(2), 1).await.unwrap();
@@ -68,7 +68,7 @@ async fn ledger_and_fill_replay_agree(pool: PgPool) {
 #[sqlx::test]
 async fn save_order_updates_in_place(pool: PgPool) {
     let store = Store::new(pool);
-    store.create_account("a", "Test", None, &[(Currency::Krw, dec!(1000000))], Utc::now()).await.unwrap();
+    store.create_account("a", "Test", &[(Currency::Krw, dec!(1000000))], Utc::now()).await.unwrap();
     let mut o = order(7);
     o.status = OrderStatus::Open;
     store.save_order(&o, 1).await.unwrap();
@@ -80,7 +80,7 @@ async fn save_order_updates_in_place(pool: PgPool) {
 #[sqlx::test]
 async fn reset_starts_a_new_generation(pool: PgPool) {
     let store = Store::new(pool);
-    store.create_account("a", "Test", Some("agent-1"), &[(Currency::Krw, dec!(1000000))], Utc::now()).await.unwrap();
+    store.create_account("a", "Test", &[(Currency::Krw, dec!(1000000))], Utc::now()).await.unwrap();
     store.save_order(&order(1), 1).await.unwrap();
     store.save_fill(&fill(1, Side::Buy, dec!(10), dec!(700000), dec!(105), dec!(0)), 1).await.unwrap();
     let generation = store.reset_account("a", &[(Currency::Krw, dec!(5000000)), (Currency::Usd, dec!(1000))], Utc::now()).await.unwrap();
@@ -96,7 +96,7 @@ async fn reset_starts_a_new_generation(pool: PgPool) {
 #[sqlx::test]
 async fn conversions_survive_replay(pool: PgPool) {
     let store = Store::new(pool);
-    store.create_account("a", "Test", None, &[(Currency::Krw, dec!(2000000))], Utc::now()).await.unwrap();
+    store.create_account("a", "Test", &[(Currency::Krw, dec!(2000000))], Utc::now()).await.unwrap();
     let c = Conversion { from: Currency::Krw, to: Currency::Usd, debit: dec!(1365350), credit: dec!(999), rate: dec!(0.00073167) };
     store.save_conversion("a", 1, &c, Utc::now()).await.unwrap();
     let cash = store.cash_balances("a", 1).await.unwrap();
@@ -113,13 +113,13 @@ fn micros() -> chrono::DateTime<Utc> {
 #[sqlx::test]
 async fn orders_and_fills_round_trip(pool: PgPool) {
     let store = Store::new(pool);
-    store.create_account("a", "Test", Some("agent-1"), &[(Currency::Krw, dec!(1000000))], Utc::now()).await.unwrap();
-    store.create_account("b", "Manual", None, &[(Currency::Krw, dec!(1))], Utc::now()).await.unwrap();
+    store.create_account("a", "Test", &[(Currency::Krw, dec!(1000000))], Utc::now()).await.unwrap();
+    store.create_account("b", "Manual", &[(Currency::Krw, dec!(1))], Utc::now()).await.unwrap();
     assert_eq!(
         store.list_accounts().await.unwrap(),
         vec![
-            AccountRow { id: "a".into(), name: "Test".into(), agent_id: Some("agent-1".into()), generation: 1 },
-            AccountRow { id: "b".into(), name: "Manual".into(), agent_id: None, generation: 1 },
+            AccountRow { id: "a".into(), name: "Test".into(), generation: 1 },
+            AccountRow { id: "b".into(), name: "Manual".into(), generation: 1 },
         ]
     );
 
@@ -151,7 +151,7 @@ async fn persister_writes_in_order_then_republishes(pool: PgPool) {
     use atrader::persist::persist;
     use std::sync::Arc;
     let store = Arc::new(Store::new(pool));
-    store.create_account("a", "Test", None, &[(Currency::Krw, dec!(2000000))], Utc::now()).await.unwrap();
+    store.create_account("a", "Test", &[(Currency::Krw, dec!(2000000))], Utc::now()).await.unwrap();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let (bus, mut events) = tokio::sync::broadcast::channel(16);
     tx.send(Stamped { generation: 1, event: Journal::Order(order(1)) }).unwrap();
@@ -173,7 +173,7 @@ async fn persister_keeps_the_generation_it_started_with(pool: PgPool) {
     use atrader::persist::persist;
     use std::sync::Arc;
     let store = Arc::new(Store::new(pool));
-    store.create_account("a", "Test", None, &[(Currency::Krw, dec!(2000000))], Utc::now()).await.unwrap();
+    store.create_account("a", "Test", &[(Currency::Krw, dec!(2000000))], Utc::now()).await.unwrap();
     store.reset_account("a", &[(Currency::Krw, dec!(5))], Utc::now()).await.unwrap(); // reset while serving
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let (bus, _) = tokio::sync::broadcast::channel(16);
@@ -190,7 +190,7 @@ async fn persister_skips_integrity_failures_without_stalling(pool: PgPool) {
     use atrader::persist::persist;
     use std::sync::Arc;
     let store = Arc::new(Store::new(pool));
-    store.create_account("a", "Test", None, &[(Currency::Krw, dec!(2000000))], Utc::now()).await.unwrap();
+    store.create_account("a", "Test", &[(Currency::Krw, dec!(2000000))], Utc::now()).await.unwrap();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let (bus, _) = tokio::sync::broadcast::channel(16);
     tx.send(Stamped { generation: 1, event: Journal::Fill(fill(99, Side::Buy, dec!(1), dec!(1), dec!(0), dec!(0))) }).unwrap(); // no order 99
@@ -216,7 +216,7 @@ async fn bars_and_snapshots_round_trip(pool: PgPool) {
     let bars = store.bars(&id, at(0)).await.unwrap();
     assert_eq!(bars.iter().map(|b| b.close).collect::<Vec<_>>(), vec![dec!(99), dec!(101)]);
 
-    store.create_account("a", "Test", None, &[(Currency::Krw, dec!(1))], Utc::now()).await.unwrap();
+    store.create_account("a", "Test", &[(Currency::Krw, dec!(1))], Utc::now()).await.unwrap();
     let s = Snapshot { account: "a".into(), generation: 1, at: at(5), kind: SnapshotKind::Daily, equity_krw: dec!(10), cash_krw: dec!(4), positions_krw: dec!(6) };
     store.save_snapshot(&s).await.unwrap();
     assert_eq!(store.snapshots("a", 1, None, false).await.unwrap(), vec![s.clone()]);
@@ -243,7 +243,7 @@ async fn late_bar_fragments_merge_instead_of_overwriting(pool: PgPool) {
 async fn daily_snapshots_can_be_read_alone(pool: PgPool) {
     use atrader::performance::{Snapshot, SnapshotKind};
     let store = Store::new(pool);
-    store.create_account("a", "Test", None, &[(Currency::Krw, dec!(1))], Utc::now()).await.unwrap();
+    store.create_account("a", "Test", &[(Currency::Krw, dec!(1))], Utc::now()).await.unwrap();
     for (kind, secs) in [(SnapshotKind::Minute, 0), (SnapshotKind::Daily, 1), (SnapshotKind::Minute, 2)] {
         let s = Snapshot { account: "a".into(), generation: 1, at: Utc::now() + chrono::Duration::seconds(secs), kind, equity_krw: dec!(1), cash_krw: dec!(1), positions_krw: dec!(0) };
         store.save_snapshot(&s).await.unwrap();
@@ -256,8 +256,8 @@ async fn daily_snapshots_can_be_read_alone(pool: PgPool) {
 async fn alerts_round_trip_per_account_and_generation(pool: PgPool) {
     use atrader::alerts::{Alert, Condition};
     let store = Store::new(pool);
-    store.create_account("a", "A", Some("ag"), &[(Currency::Krw, dec!(1))], Utc::now()).await.unwrap();
-    store.create_account("b", "B", Some("ag"), &[(Currency::Krw, dec!(1))], Utc::now()).await.unwrap();
+    store.create_account("a", "A", &[(Currency::Krw, dec!(1))], Utc::now()).await.unwrap();
+    store.create_account("b", "B", &[(Currency::Krw, dec!(1))], Utc::now()).await.unwrap();
     let btc: InstrumentId = "UPBIT:KRW-BTC".parse().unwrap();
     let alert = |account: &str, condition| Alert {
         id: 0,

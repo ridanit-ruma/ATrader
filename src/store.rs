@@ -20,8 +20,6 @@ use crate::performance::{Snapshot, SnapshotKind};
 pub struct AccountRow {
     pub id: String,
     pub name: String,
-    /// The Attacca agent that trades this account; `None` hides it from tools.
-    pub agent_id: Option<String>,
     pub generation: i32,
 }
 
@@ -167,15 +165,13 @@ impl Store {
         &self,
         id: &str,
         name: &str,
-        agent_id: Option<&str>,
         initial: &[(Currency, Decimal)],
         at: DateTime<Utc>,
     ) -> sqlx::Result<()> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("INSERT INTO accounts (id, name, agent_id, created_at) VALUES ($1, $2, $3, $4)")
+        sqlx::query("INSERT INTO accounts (id, name, created_at) VALUES ($1, $2, $3)")
             .bind(id)
             .bind(name)
-            .bind(agent_id)
             .bind(at)
             .execute(&mut *tx)
             .await?;
@@ -305,10 +301,10 @@ impl Store {
     }
 
     pub async fn list_accounts(&self) -> sqlx::Result<Vec<AccountRow>> {
-        let rows = sqlx::query("SELECT id, name, agent_id, generation FROM accounts ORDER BY id").fetch_all(&self.pool).await?;
+        let rows = sqlx::query("SELECT id, name, generation FROM accounts ORDER BY id").fetch_all(&self.pool).await?;
         Ok(rows
             .iter()
-            .map(|r| AccountRow { id: r.get("id"), name: r.get("name"), agent_id: r.get("agent_id"), generation: r.get("generation") })
+            .map(|r| AccountRow { id: r.get("id"), name: r.get("name"), generation: r.get("generation") })
             .collect())
     }
 
@@ -511,13 +507,6 @@ impl Store {
             .execute(&self.pool)
             .await?;
         Ok(())
-    }
-
-    /// Hand the account to another agent (or none). The alert session belonged to the old agent,
-    /// so it is forgotten. False when there is no such account.
-    pub async fn set_account_agent(&self, account: &str, agent: Option<&str>) -> sqlx::Result<bool> {
-        let r = sqlx::query("UPDATE accounts SET agent_id = $2, alert_session_id = NULL WHERE id = $1").bind(account).bind(agent).execute(&self.pool).await?;
-        Ok(r.rows_affected() == 1)
     }
 
     pub async fn alert_session(&self, account: &str) -> sqlx::Result<Option<String>> {

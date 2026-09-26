@@ -76,11 +76,18 @@ impl MarketFeed for Fake {
     }
 }
 
+/// Accounts `bot` ("Bot") and `manual` ("Manual"), each with ₩1bn.
 pub async fn rig(pool: PgPool) -> (Arc<App>, TraderTools) {
+    rig_with(pool, &["bot", "manual"]).await
+}
+
+pub async fn rig_with(pool: PgPool, accounts: &[&str]) -> (Arc<App>, TraderTools) {
     let clock = ManualClock::new(Utc.with_ymd_and_hms(2026, 9, 23, 1, 0, 0).unwrap());
     let store = Arc::new(Store::new(pool));
-    store.create_account("bot", "Bot", Some("agent-1"), &[(Currency::Krw, dec!(1000000000))], Utc::now()).await.unwrap();
-    store.create_account("manual", "Manual", None, &[(Currency::Krw, dec!(1000000000))], Utc::now()).await.unwrap();
+    for id in accounts {
+        let name = format!("{}{}", id[..1].to_uppercase(), &id[1..]);
+        store.create_account(id, &name, &[(Currency::Krw, dec!(1000000000))], Utc::now()).await.unwrap();
+    }
     let (jtx, jrx) = mpsc::unbounded_channel();
     let broker = Arc::new(SimBroker::new(Arc::new(clock.clone()), Calendar::default()).with_journal(jtx));
     restore(&store, &broker).await.unwrap();
