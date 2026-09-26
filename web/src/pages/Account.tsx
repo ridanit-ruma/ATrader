@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { ConvertCash } from "@/components/ConvertCash";
 import { Link, useParams } from "react-router";
 import { api } from "@/api";
 import { fmtKrw, fmtNum, fmtPct, fmtTime } from "@/format";
@@ -56,6 +57,8 @@ export function Account() {
           footer={`승률 ${perf?.win_rate_pct == null ? "—" : `${Number(perf.win_rate_pct).toFixed(1)}%`}`}
         />
       </div>
+
+      <ConvertCash account={id} summary={d.summary} />
 
       <Section
         title="평가금액 추이"

@@ -230,7 +230,10 @@ async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
     let dart = crate::secret_env("DART_API_KEY").map(crate::fundamentals::dart::DartClient::new);
     let edgar = crate::secret_env("EDGAR_USER_AGENT").map(crate::fundamentals::edgar::EdgarClient::new);
     tracing::info!(dart = dart.is_some(), edgar = edgar.is_some(), "fundamentals sources");
-    let app = Arc::new(App::new(broker.clone(), store, market, FxCache::new()).await?.with_fundamentals(dart, edgar).with_alerts(alert_tx));
+    let fx = FxCache::new();
+    #[cfg(feature = "private-feeds")]
+    let fx = fx.with_source(crate::feed::private::fx_source());
+    let app = Arc::new(App::new(broker.clone(), store, market, fx).await?.with_fundamentals(dart, edgar).with_alerts(alert_tx));
     app.market.refresh_pins();
     let notifier: Arc<dyn crate::alerts::deliver::Notifier> = Arc::new(crate::alerts::deliver::AttaccaNotifier::new(slot.clone()));
     tokio::spawn(crate::alerts::deliver::alert_loop(app.clone(), bus.subscribe(), alert_rx, notifier.clone()));

@@ -57,7 +57,10 @@ atrader serve --no-zyris
 
 Fundamentals are optional: set `DART_API_KEY` (free, issued at opendart.fss.or.kr) for Korean
 companies and `EDGAR_USER_AGENT` (for example `"ATrader you@example.com"`, as SEC requires) for US
-companies. KIS keys (`KIS_APP_KEY`, `KIS_APP_SECRET`) enable Korean and US stock quotes.
+companies. KIS keys (`KIS_APP_KEY`, `KIS_APP_SECRET`) enable Korean and US stock quotes. USD/KRW comes from the
+ECB reference rate (Frankfurter), which moves once per business day; a live source can be plugged
+in through `fx::FxSource`. Cash moves between KRW, USD and USDT with the agent's `convert_currency`
+tool or the account page's exchange card, at that rate less a 0.1% spread.
 
 `atrader account reset <id>` starts an account over and keeps its history. Stop `atrader serve`
 before a reset: a running server keeps trading the old state in memory.

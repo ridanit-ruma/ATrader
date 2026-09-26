@@ -275,3 +275,20 @@ async fn briefings_are_set_per_account(pool: PgPool) {
     let send = req("POST", "/api/accounts/bot/briefing/send", Some(&c), None);
     assert_eq!(r.clone().oneshot(send).await.unwrap().status(), StatusCode::CONFLICT);
 }
+
+#[sqlx::test]
+async fn cash_can_be_converted_from_the_dashboard(pool: PgPool) {
+    let (r, _, secret) = web(pool).await;
+    let c = login(&r, &secret).await;
+    let convert = |body: serde_json::Value| req("POST", "/api/accounts/bot/convert", Some(&c), Some(body));
+    let ok = r.clone().oneshot(convert(serde_json::json!({"from": "KRW", "to": "USD", "amount": "1400000"}))).await.unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(ok.into_body(), 10_000).await.unwrap()).unwrap();
+    let credit: rust_decimal::Decimal = v["credit"].as_str().unwrap().parse().unwrap();
+    assert_eq!(credit, rust_decimal::Decimal::from(999), "₩1.4m at 1400 less the 0.1% spread: {v}");
+    let too_much = r.clone().oneshot(convert(serde_json::json!({"from": "USD", "to": "KRW", "amount": "5000"}))).await.unwrap();
+    assert_eq!(too_much.status(), StatusCode::BAD_REQUEST);
+    let audit = r.clone().oneshot(req("GET", "/api/audit", Some(&c), None)).await.unwrap();
+    let a: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(audit.into_body(), 100_000).await.unwrap()).unwrap();
+    assert!(a.as_array().unwrap().iter().any(|e| e["action"] == "convert"));
+}

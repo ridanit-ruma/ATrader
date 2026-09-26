@@ -54,6 +54,8 @@ export const api = {
   chart: (id: string, interval: string, account?: string) =>
     get<T.Chart>(`/api/instruments/${enc(id)}/chart?interval=${interval}&limit=300${account ? `&account=${enc(account)}` : ""}`),
   health: () => get<T.Health>("/api/health"),
+  convert: (id: string, from: string, to: string, amount: string) =>
+    post<{ from: string; to: string; debit: T.Dec; credit: T.Dec; rate: T.Dec }>(`/api/accounts/${enc(id)}/convert`, { from, to, amount }),
   setBriefing: (id: string, briefing: string) => call("PUT", `/api/accounts/${enc(id)}/briefing`, { briefing }),
   sendBriefing: (id: string) => post(`/api/accounts/${enc(id)}/briefing/send`),
   attaccaSessions: () => get<T.AttaccaSessions>("/api/attacca/sessions"),

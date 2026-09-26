@@ -488,6 +488,23 @@ async fn set_alert_session(State(s): State<WebState>, peer: Peer, headers: Heade
 }
 
 #[derive(Deserialize)]
+struct ConvertBody {
+    from: String,
+    to: String,
+    amount: Decimal,
+}
+
+/// Exchange the account's cash, as the agent's `convert_currency` does.
+async fn convert(State(s): State<WebState>, peer: Peer, headers: HeaderMap, Path(id): Path<String>, Json(b): Json<ConvertBody>) -> ApiResult {
+    let (user, _) = authed(&s, &headers, false).await?;
+    row(&s, &id)?;
+    let done = s.tools().convert_currency(Some(id.clone()), b.from, b.to, b.amount).await.map_err(tool_error)?;
+    let detail = format!("{id}: {} {} -> {} {}", done.debit, done.from, done.credit, done.to);
+    let _ = s.auth.audit(Some(user.id), "convert", &detail, &peer_ip(&headers, peer)).await;
+    Ok(Json(to_json(done)?))
+}
+
+#[derive(Deserialize)]
 struct BriefingBody {
     briefing: String,
 }
@@ -888,6 +905,7 @@ pub fn router(state: WebState) -> Router {
         .route("/api/accounts/{id}/reset", post(reset_account))
         .route("/api/accounts/{id}/alert-session", put(set_alert_session))
         .route("/api/accounts/{id}/briefing", put(set_briefing))
+        .route("/api/accounts/{id}/convert", post(convert))
         .route("/api/accounts/{id}/briefing/send", post(send_briefing))
         .route("/api/attacca/sessions", get(attacca_sessions))
         .route("/api/accounts/{id}/equity", get(equity))
