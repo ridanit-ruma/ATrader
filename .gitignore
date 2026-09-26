@@ -8,3 +8,4 @@ result
 secrets/
 .env
 src/feed/private/
+web/tsconfig.tsbuildinfo
