@@ -433,9 +433,8 @@ fn announced_schemas_are_portable() {
                         assert!(!m.contains_key("pattern"), "{tool}{path}: pattern on a number");
                     }
                 }
-                if let Some(f) = m.get("format") {
-                    assert_eq!(f, "date-time", "{tool}{path}: format {f}");
-                }
+                // DeepSeek accepts only email/hostname/ipv4/ipv6/uuid string formats; carry none.
+                assert!(!m.contains_key("format"), "{tool}{path}: format {:?}", m.get("format"));
                 assert_ne!(m.get("default"), Some(&serde_json::Value::Null), "{tool}{path}: default null");
                 for (k, x) in m {
                     match (k.as_str(), x) {
@@ -462,6 +461,9 @@ fn announced_schemas_are_portable() {
     assert_eq!(qty["type"], "number", "decimals are numbers: {qty}");
     let side = &order.request_schema["properties"]["order"]["properties"]["side"];
     assert_eq!(side["enum"], serde_json::json!(["buy", "sell"]), "enums are inlined: {side}");
+    let fills = d.tools.iter().find(|t| t.name == "list_fills").unwrap();
+    let since = fills.request_schema["properties"]["since"]["description"].as_str().unwrap_or_default();
+    assert!(since.contains("RFC 3339"), "a dropped date-time format is spelled out: {since}");
     // What the schema now asks for (plain numbers) must decode exactly.
     let o: OrderInput = serde_json::from_value(serde_json::json!({"account": "bot", "instrument": "UPBIT:KRW-BTC", "side": "buy", "kind": "limit", "qty": 0.1, "limit_price": 99999000, "reason": "r"})).unwrap();
     assert_eq!((o.qty, o.limit_price), (Some(dec!(0.1)), Some(dec!(99999000))));

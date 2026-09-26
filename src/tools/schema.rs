@@ -1,7 +1,7 @@
 //! Tool schemas as plain JSON Schema that any LLM tool API accepts. schemars emits `$ref`s into
 //! `$defs`, type unions and nullable `anyOf`s for `Option`, arbitrary-precision decimals as
-//! `string | number` with a pattern, and Rust integer formats (`uint32`); `portable` rewrites them
-//! into inlined, single-typed schemas. Decimals become `number`, which they deserialize from.
+//! `string | number` with a pattern, and formats (`uint32`, `date-time`) that DeepSeek rejects;
+//! `portable` rewrites them into inlined, single-typed schemas. Decimals become `number`, which they deserialize from.
 
 use serde_json::{Map, Value};
 use zyris::{CapabilityDescriptor, IncomingCall, Outgoing, ServeCapability};
@@ -85,8 +85,15 @@ fn flatten(mut m: Map<String, Value>) -> Value {
     if m.get("default") == Some(&Value::Null) {
         m.remove("default");
     }
-    if m.get("format").is_some_and(|f| f != "date-time") {
-        m.remove("format");
+    // DeepSeek rejects any string format but email/hostname/ipv4/ipv6/uuid, and integer formats
+    // (`uint32`) are Rust's, not JSON Schema's: drop them all, keeping what a date-time means.
+    if m.remove("format").is_some_and(|f| f == "date-time") {
+        let hint = "RFC 3339 time, e.g. 2026-09-25T09:00:00+09:00";
+        let text = match m.get("description").and_then(Value::as_str) {
+            Some(d) => format!("{d} ({hint})"),
+            None => hint.to_string(),
+        };
+        m.insert("description".into(), text.into());
     }
     if m.get("type").and_then(Value::as_str) == Some("object") && !m.contains_key("properties") {
         m.insert("properties".into(), Value::Object(Map::new()));
