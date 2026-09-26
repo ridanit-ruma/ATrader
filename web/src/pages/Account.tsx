@@ -17,7 +17,8 @@ const RANGES = [
 export function Account() {
   const id = useParams().id!;
   const [range, setRange] = useState<(typeof RANGES)[number][0]>("1m");
-  const detail = useQuery({ queryKey: ["account", id], queryFn: () => api.account(id) });
+  // Positions are valued at live prices: refresh them every few seconds.
+  const detail = useQuery({ queryKey: ["account", id], queryFn: () => api.account(id), refetchInterval: 3000 });
   const equity = useQuery({ queryKey: ["account", id, "equity", range], queryFn: () => api.equity(id, range) });
   const pnl = useQuery({ queryKey: ["account", id, "pnl"], queryFn: () => api.pnl(id) });
   const fills = useQuery({ queryKey: ["account", id, "fills"], queryFn: () => api.fills(id) });

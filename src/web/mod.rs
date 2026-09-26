@@ -487,6 +487,38 @@ async fn set_alert_session(State(s): State<WebState>, peer: Peer, headers: Heade
     Ok(Json(json!({"id": id, "session_id": session})))
 }
 
+#[derive(Deserialize)]
+struct BriefingBody {
+    briefing: String,
+}
+
+async fn set_briefing(State(s): State<WebState>, peer: Peer, headers: HeaderMap, Path(id): Path<String>, Json(b): Json<BriefingBody>) -> ApiResult {
+    let (user, _) = authed(&s, &headers, false).await?;
+    row(&s, &id)?;
+    if crate::alerts::briefing::Cadence::parse(&b.briefing).is_none() {
+        return Err(bad_request("briefing is off, edges, 1h, 2h or 4h"));
+    }
+    s.app.store.set_briefing(&id, &b.briefing).await.map_err(internal)?;
+    let _ = s.auth.audit(Some(user.id), "briefing", &format!("{id} -> {}", b.briefing), &peer_ip(&headers, peer)).await;
+    Ok(Json(json!({"id": id, "briefing": b.briefing})))
+}
+
+/// Send a briefing to the account's alert conversation now.
+async fn send_briefing(State(s): State<WebState>, headers: HeaderMap, Path(id): Path<String>) -> ApiResult {
+    use crate::alerts::deliver::{AttaccaNotifier, Notifier};
+    authed(&s, &headers, false).await?;
+    row(&s, &id)?;
+    let Some(session) = s.app.store.alert_session(&id).await.map_err(internal)? else {
+        return Err(ApiError(StatusCode::CONFLICT, "no_conversation", "choose the conversation that receives this account's alerts first".into()));
+    };
+    let text = crate::alerts::briefing::briefing_text(&s.app, &id, &[]).await;
+    AttaccaNotifier::new(s.attacca.clone())
+        .send(&session, &text)
+        .await
+        .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, "upstream", format!("{e:#}")))?;
+    Ok(Json(json!({"sent": true})))
+}
+
 fn kst_midnight(now: DateTime<Utc>) -> DateTime<Utc> {
     let day = now.with_timezone(&chrono_tz::Asia::Seoul).date_naive();
     chrono_tz::Asia::Seoul.from_local_datetime(&day.and_hms_opt(0, 0, 0).expect("midnight")).single().map_or(now, |t| t.with_timezone(&Utc))
@@ -497,13 +529,15 @@ async fn overview(State(s): State<WebState>, headers: HeaderMap) -> ApiResult {
     let t = s.tools();
     let midnight = kst_midnight(Utc::now());
     let mut out = Vec::new();
+    let briefings = s.app.store.briefing_targets().await.map_err(internal)?;
     for r in s.app.store.list_accounts().await.map_err(internal)? {
         let summary = t.get_account(Some(r.id.clone())).await.map_err(tool_error)?;
         let open = s.app.store.snapshots(&r.id, r.generation, Some(midnight), true).await.map_err(internal)?;
         let day_pnl = open.first().map(|o| summary.equity_krw - o.equity_krw);
         let total = t.get_performance(Some(r.id.clone()), "all".into()).await.ok().map(|p| p.return_pct);
         let alert_session = s.app.store.alert_session(&r.id).await.map_err(internal)?;
-        out.push(json!({"id": r.id, "alert_session_id": alert_session, "generation": r.generation, "summary": summary, "day_pnl_krw": day_pnl, "total_return_pct": total}));
+        let briefing = briefings.iter().find(|b| b.0 == r.id).map(|b| b.1.clone());
+        out.push(json!({"id": r.id, "alert_session_id": alert_session, "briefing": briefing, "generation": r.generation, "summary": summary, "day_pnl_krw": day_pnl, "total_return_pct": total}));
     }
     Ok(Json(Value::Array(out)))
 }
@@ -780,9 +814,9 @@ async fn stream(State(s): State<WebState>, headers: HeaderMap) -> Result<Sse<imp
     })
     .filter_map(|e| async { e });
     let ticks = stream::unfold((s.clone(), 0u64), |(s, n)| async move {
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         let mut events = equity_events(&s).await;
-        if n % 3 == 0 {
+        if n % 10 == 0 {
             events.extend(event("health", health_json(&s)));
         }
         Some((stream::iter(events), (s, n + 1)))
@@ -853,6 +887,8 @@ pub fn router(state: WebState) -> Router {
         .route("/api/accounts/{id}", get(account))
         .route("/api/accounts/{id}/reset", post(reset_account))
         .route("/api/accounts/{id}/alert-session", put(set_alert_session))
+        .route("/api/accounts/{id}/briefing", put(set_briefing))
+        .route("/api/accounts/{id}/briefing/send", post(send_briefing))
         .route("/api/attacca/sessions", get(attacca_sessions))
         .route("/api/accounts/{id}/equity", get(equity))
         .route("/api/accounts/{id}/fills", get(fills))

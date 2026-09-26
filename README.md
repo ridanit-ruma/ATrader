@@ -151,6 +151,13 @@ that account on the dashboard's alerts page, from the conversations in the Attac
 them. The zyris credential needs the `projects:read`, `projects:write`, `sessions:read` and
 `sessions:write` scopes, which `zyris enroll` and the dashboard request.
 
+## Briefings
+
+Without prompting, an agent only acts when someone talks to it. So ATrader also posts a briefing
+to each account's alert conversation at every KRX and US session open and close, and every two
+hours in between (per account on the alerts page: off, open/close only, or every 1, 2 or 4 hours):
+the account, its positions, and the open sessions' gainers, losers and most traded.
+
 ## Stack
 
 Rust (tokio, axum, sqlx/Postgres) in a single binary, with a React dashboard served by the same

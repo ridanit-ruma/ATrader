@@ -3,6 +3,7 @@ import { api } from "@/api";
 import { fmtNum, fmtTime } from "@/format";
 import { Section, DataTable, PageHeader } from "@/components/common";
 import { AlertSessionPicker } from "@/components/AlertSessionPicker";
+import { BriefingControl } from "@/components/BriefingControl";
 import { TableCell, TableRow } from "@/components/ui/table";
 
 export function Alerts() {
@@ -15,12 +16,17 @@ export function Alerts() {
     <div className="grid gap-4">
       <PageHeader
         title="알림"
-        description="에이전트가 걸어 둔 알림입니다. 울리면 계좌마다 고른 대화로 메시지가 갑니다. Attacca의 ATrader 프로젝트에서 대화를 만들면 목록에 나타납니다."
+        description="계좌마다 알림과 정기 브리핑을 받을 대화를 고릅니다. 브리핑은 한국·미국 장 시작과 마감, 그리고 장중 정한 주기마다 계좌 현황과 시장 상위 종목을 보냅니다. Attacca의 ATrader 프로젝트에서 대화를 만들면 목록에 나타납니다."
       />
       {accounts.map((a, i) => {
         const rows = alerts[i]?.data ?? [];
         return (
-          <Section key={a.id} title={a.summary.name} right={<AlertSessionPicker account={a.id} current={a.alert_session_id} />}>
+          <Section key={a.id} title={a.summary.name} right={
+              <div className="grid justify-items-end gap-2">
+                <AlertSessionPicker account={a.id} current={a.alert_session_id} />
+                <BriefingControl account={a.id} current={a.briefing} />
+              </div>
+            }>
             <DataTable head={["종류", "대상", "기준", "메모", "상태", "마지막 발동", "만든 시각"]} empty={!rows.length}>
               {rows.map((r) => (
                 <TableRow key={r.id} className={r.active ? "" : "text-muted-foreground"}>

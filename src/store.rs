@@ -513,6 +513,16 @@ impl Store {
         sqlx::query_scalar("SELECT alert_session_id FROM accounts WHERE id = $1").bind(account).fetch_one(&self.pool).await
     }
 
+    /// (account, briefing cadence, alert session) for every account.
+    pub async fn briefing_targets(&self) -> sqlx::Result<Vec<(String, String, Option<String>)>> {
+        sqlx::query_as("SELECT id, briefing, alert_session_id FROM accounts ORDER BY id").fetch_all(&self.pool).await
+    }
+
+    pub async fn set_briefing(&self, account: &str, cadence: &str) -> sqlx::Result<()> {
+        sqlx::query("UPDATE accounts SET briefing = $2 WHERE id = $1").bind(account).bind(cadence).execute(&self.pool).await?;
+        Ok(())
+    }
+
     /// The Attacca session alerts on `account` go to; `None` clears it.
     pub async fn set_alert_session(&self, account: &str, session: Option<&str>) -> sqlx::Result<()> {
         sqlx::query("UPDATE accounts SET alert_session_id = $2 WHERE id = $1").bind(account).bind(session).execute(&self.pool).await?;

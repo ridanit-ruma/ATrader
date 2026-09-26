@@ -232,7 +232,9 @@ async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
     tracing::info!(dart = dart.is_some(), edgar = edgar.is_some(), "fundamentals sources");
     let app = Arc::new(App::new(broker.clone(), store, market, FxCache::new()).await?.with_fundamentals(dart, edgar).with_alerts(alert_tx));
     app.market.refresh_pins();
-    tokio::spawn(crate::alerts::deliver::alert_loop(app.clone(), bus.subscribe(), alert_rx, Arc::new(crate::alerts::deliver::AttaccaNotifier::new(slot.clone()))));
+    let notifier: Arc<dyn crate::alerts::deliver::Notifier> = Arc::new(crate::alerts::deliver::AttaccaNotifier::new(slot.clone()));
+    tokio::spawn(crate::alerts::deliver::alert_loop(app.clone(), bus.subscribe(), alert_rx, notifier.clone()));
+    tokio::spawn(crate::alerts::briefing::briefing_loop(app.clone(), notifier));
     tokio::spawn(crate::app::snapshot_loop(app.clone()));
 
     // Off only when the dashboard is reached over plain HTTP inside an encrypted tailnet (a

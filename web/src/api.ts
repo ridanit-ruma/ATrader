@@ -54,6 +54,8 @@ export const api = {
   chart: (id: string, interval: string, account?: string) =>
     get<T.Chart>(`/api/instruments/${enc(id)}/chart?interval=${interval}&limit=300${account ? `&account=${enc(account)}` : ""}`),
   health: () => get<T.Health>("/api/health"),
+  setBriefing: (id: string, briefing: string) => call("PUT", `/api/accounts/${enc(id)}/briefing`, { briefing }),
+  sendBriefing: (id: string) => post(`/api/accounts/${enc(id)}/briefing/send`),
   attaccaSessions: () => get<T.AttaccaSessions>("/api/attacca/sessions"),
   setAlertSession: (id: string, session_id: string | null) => call("PUT", `/api/accounts/${enc(id)}/alert-session`, { session_id }),
   keys: () => get<T.KeySetting[]>("/api/settings/keys"),

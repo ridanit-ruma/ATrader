@@ -259,3 +259,19 @@ async fn alerts_go_to_a_chosen_conversation(pool: PgPool) {
     let missing = req("PUT", "/api/accounts/nope/alert-session", Some(&c), Some(serde_json::json!({"session_id": "s"})));
     assert_eq!(r.clone().oneshot(missing).await.unwrap().status(), StatusCode::NOT_FOUND);
 }
+
+#[sqlx::test]
+async fn briefings_are_set_per_account(pool: PgPool) {
+    let (r, _, secret) = web(pool).await;
+    let c = login(&r, &secret).await;
+    let set = |v: &str| req("PUT", "/api/accounts/bot/briefing", Some(&c), Some(serde_json::json!({"briefing": v})));
+    assert_eq!(r.clone().oneshot(set("hourly")).await.unwrap().status(), StatusCode::BAD_REQUEST);
+    assert_eq!(r.clone().oneshot(set("4h")).await.unwrap().status(), StatusCode::OK);
+    let o = r.clone().oneshot(req("GET", "/api/overview", Some(&c), None)).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(o.into_body(), 100_000).await.unwrap()).unwrap();
+    let bot = v.as_array().unwrap().iter().find(|a| a["id"] == "bot").unwrap();
+    assert_eq!(bot["briefing"], "4h");
+    // Sending one now needs a chosen conversation and a live Attacca link.
+    let send = req("POST", "/api/accounts/bot/briefing/send", Some(&c), None);
+    assert_eq!(r.clone().oneshot(send).await.unwrap().status(), StatusCode::CONFLICT);
+}

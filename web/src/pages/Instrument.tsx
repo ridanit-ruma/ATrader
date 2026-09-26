@@ -16,7 +16,7 @@ export function Instrument() {
   const q = useQuery({
     queryKey: ["account", account ?? "", "chart", id, interval],
     queryFn: () => api.chart(id, interval, account),
-    refetchInterval: 30_000,
+    refetchInterval: 5_000,
   });
   const quote = q.data?.quote;
   return (

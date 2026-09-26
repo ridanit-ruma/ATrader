@@ -26,6 +26,7 @@ export interface AccountSummary {
 export interface OverviewRow {
   id: string;
   alert_session_id: string | null;
+  briefing: "off" | "edges" | "1h" | "2h" | "4h" | null;
   generation: number;
   summary: AccountSummary;
   day_pnl_krw: Dec | null;
