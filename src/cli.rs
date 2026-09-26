@@ -272,6 +272,7 @@ async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
         let restart = stop.await?;
         return finish(&broker, writer, restart).await;
     };
+    let connected = zyris_connected.clone();
     let server = zyris_server();
     let name = std::env::var("ATRADER_NODE_NAME").unwrap_or_else(|_| "atrader".into());
     let link = zyris::Node::builder()
@@ -282,7 +283,7 @@ async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
             let slot = slot.clone();
             move |conn| {
                 let slot = slot.clone();
-                // ponytail: set once and never cleared; clear it on disconnect if the SDK grows a hook.
+                // Cleared when the link closes for good (below); a brief reconnect leaves it set.
                 zyris_connected.store(true, std::sync::atomic::Ordering::Relaxed);
                 async move { slot.put(conn) }
             }
@@ -300,15 +301,20 @@ async fn serve(store: Arc<Store>, with_zyris: bool) -> anyhow::Result<()> {
         }
     };
     tracing::info!(node = %link.node_id(), %server, "serving trader capability");
+    tokio::pin!(stop);
     let restart = tokio::select! {
         closed = link.wait_closed() => {
-            if let Err(e) = closed {
-                drain(&broker, writer).await?;
-                return Err(e.into());
+            // Attacca closes the link when this credential is revoked, and approving a new one
+            // for this node revokes the old: stay up, so the dashboard can finish that enrollment
+            // and restart with it.
+            match closed {
+                Err(e) => tracing::error!(error = %e, "Attacca closed the link; reconnect it from the dashboard settings"),
+                Ok(()) => tracing::info!("Attacca closed the link"),
             }
-            false
+            connected.store(false, std::sync::atomic::Ordering::Relaxed);
+            (&mut stop).await?
         }
-        stopped = stop => {
+        stopped = &mut stop => {
             let restart = stopped?;
             link.disconnect().await;
             restart
