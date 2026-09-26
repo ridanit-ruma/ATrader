@@ -479,3 +479,18 @@ async fn giving_an_account_to_an_agent_shows_it_and_forgets_the_alert_session(po
     assert_eq!(app.store.alert_session("manual").await.unwrap(), None, "the old agent's session is not reused");
     assert!(app.set_account_agent("nope", None).await.is_err());
 }
+
+/// zyris sends schemas and results as msgpack. Nothing may reach it as serde_json's private
+/// arbitrary-precision marker (`{"$serde_json::private::Number": "0"}`), which DeepSeek rejected.
+#[sqlx::test]
+async fn schemas_and_results_survive_msgpack(pool: PgPool) {
+    let (_, t) = rig(pool).await;
+    // Checked on the bytes: decoding into `Value` would quietly turn the marker back into a number.
+    let clean = |bytes: Vec<u8>| !bytes.windows(12).any(|w| w == b"$serde_json:");
+    let d = atrader::tools::portable(atrader::tools::trader_capability());
+    assert!(clean(rmp_serde::to_vec_named(&d.tools).unwrap()), "schemas carry the arbitrary-precision marker");
+    let quotes = t.get_quotes(vec!["UPBIT:KRW-BTC".into()]).await.unwrap();
+    assert!(clean(rmp_serde::to_vec_named(&quotes).unwrap()), "results carry the arbitrary-precision marker");
+    let q: serde_json::Value = rmp_serde::from_slice(&rmp_serde::to_vec_named(&quotes).unwrap()).unwrap();
+    assert_eq!(q[0]["bid"], "99999000", "decimals travel as exact strings");
+}

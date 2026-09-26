@@ -108,6 +108,7 @@ dependencies = [
  "futures-util",
  "rand 0.8.8",
  "reqwest",
+ "rmp-serde",
  "rpassword",
  "rust-embed",
  "rust_decimal",
@@ -1822,7 +1823,6 @@ dependencies = [
  "serde",
  "serde_json",
  "wasm-bindgen",
- "zmij",
 ]
 
 [[package]]

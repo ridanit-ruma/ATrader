@@ -49,6 +49,16 @@ pub trait MarketFeed: Send + Sync {
 }
 
 /// No data for this long means the socket is dead.
+/// A JSON number read digit for digit, for `#[serde(deserialize_with = "crate::feed::exact")]`.
+/// serde_json would otherwise round it through f64, and Upbit sends up to 17 significant digits.
+/// (Enabling serde_json's `arbitrary_precision` instead breaks every number zyris sends as msgpack.)
+pub fn exact<'de, D: serde::Deserializer<'de>>(d: D) -> Result<rust_decimal::Decimal, D::Error> {
+    use serde::de::Error;
+    let raw: Box<serde_json::value::RawValue> = serde::Deserialize::deserialize(d)?;
+    let text = raw.get().trim_matches('"');
+    text.parse().or_else(|_| rust_decimal::Decimal::from_scientific(text)).map_err(D::Error::custom)
+}
+
 pub const IDLE_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
 /// The next item of `s`, or an error once nothing has arrived for `IDLE_TIMEOUT`.

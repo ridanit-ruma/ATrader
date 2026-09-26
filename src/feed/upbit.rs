@@ -9,7 +9,9 @@ use futures_util::SinkExt;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
+#[cfg(test)]
+use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -26,9 +28,13 @@ const WS: &str = "wss://api.upbit.com/websocket/v1";
 
 #[derive(Deserialize)]
 struct Unit {
+    #[serde(deserialize_with = "crate::feed::exact")]
     ask_price: Decimal,
+    #[serde(deserialize_with = "crate::feed::exact")]
     bid_price: Decimal,
+    #[serde(deserialize_with = "crate::feed::exact")]
     ask_size: Decimal,
+    #[serde(deserialize_with = "crate::feed::exact")]
     bid_size: Decimal,
 }
 
@@ -42,7 +48,9 @@ struct RawBook {
 #[derive(Deserialize)]
 struct RawTrade {
     code: String,
+    #[serde(deserialize_with = "crate::feed::exact")]
     trade_price: Decimal,
+    #[serde(deserialize_with = "crate::feed::exact")]
     trade_volume: Decimal,
     trade_timestamp: i64,
 }
@@ -56,7 +64,9 @@ struct RawMarket {
 
 #[derive(Deserialize)]
 struct RawCandle {
+    #[serde(deserialize_with = "crate::feed::exact")]
     trade_price: Decimal,
+    #[serde(deserialize_with = "crate::feed::exact")]
     candle_acc_trade_price: Decimal,
 }
 
@@ -76,11 +86,16 @@ fn to_book(raw: RawBook, now: DateTime<Utc>) -> Book {
 
 /// Parse one WebSocket frame. Frames that are neither books nor trades yield `None`.
 pub fn parse_ws(bytes: &[u8], now: DateTime<Utc>) -> anyhow::Result<Option<MarketEvent>> {
-    let v: Value = serde_json::from_slice(bytes)?;
-    match v.get("type").and_then(Value::as_str) {
-        Some("orderbook") => Ok(Some(MarketEvent::Book(to_book(serde_json::from_value(v)?, now)))),
+    #[derive(Deserialize)]
+    struct Kind<'a> {
+        #[serde(rename = "type", borrow)]
+        kind: Option<&'a str>,
+    }
+    // Parsed straight from the bytes, not via `Value`, so `exact` sees each number's digits.
+    match serde_json::from_slice::<Kind>(bytes)?.kind {
+        Some("orderbook") => Ok(Some(MarketEvent::Book(to_book(serde_json::from_slice(bytes)?, now)))),
         Some("trade") => {
-            let t: RawTrade = serde_json::from_value(v)?;
+            let t: RawTrade = serde_json::from_slice(bytes)?;
             Ok(Some(MarketEvent::Trade(Trade {
                 instrument: id(&t.code),
                 price: t.trade_price,
@@ -202,11 +217,17 @@ impl MarketFeed for UpbitFeed {
 #[derive(Deserialize)]
 struct RawOhlc {
     candle_date_time_utc: String,
+    #[serde(deserialize_with = "crate::feed::exact")]
     opening_price: Decimal,
+    #[serde(deserialize_with = "crate::feed::exact")]
     high_price: Decimal,
+    #[serde(deserialize_with = "crate::feed::exact")]
     low_price: Decimal,
+    #[serde(deserialize_with = "crate::feed::exact")]
     trade_price: Decimal,
+    #[serde(deserialize_with = "crate::feed::exact")]
     candle_acc_trade_volume: Decimal,
+    #[serde(deserialize_with = "crate::feed::exact")]
     candle_acc_trade_price: Decimal,
 }
 
@@ -227,9 +248,13 @@ pub fn parse_candles_ohlc(bytes: &[u8]) -> anyhow::Result<Vec<Candle>> {
 #[derive(Deserialize)]
 struct RawTicker {
     market: String,
+    #[serde(deserialize_with = "crate::feed::exact")]
     trade_price: Decimal,
+    #[serde(deserialize_with = "crate::feed::exact")]
     signed_change_rate: Decimal,
+    #[serde(deserialize_with = "crate::feed::exact")]
     acc_trade_price_24h: Decimal,
+    #[serde(deserialize_with = "crate::feed::exact")]
     acc_trade_volume_24h: Decimal,
 }
 

@@ -1,5 +1,5 @@
-// Mirrors src/web/mod.rs and src/tools/dto.rs. Decimals arrive as JSON numbers.
-export type Dec = number;
+// Mirrors src/web/mod.rs and src/tools/dto.rs. Decimals arrive as exact strings; convert with Number() to do maths.
+export type Dec = number | string;
 
 export interface Me {
   username: string;
